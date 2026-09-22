@@ -1,0 +1,14 @@
+# Environnement Python
+venv/
+__pycache__/
+*.pyc
+
+# Variables sensibles
+.env
+backend/.env
+
+# Node / frontend
+node_modules/
+
+# Éditeurs
+.vscode/

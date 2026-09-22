@@ -1,0 +1,97 @@
+services:
+  db:
+    image: postgres:16
+    container_name: zranexus-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: zranexus
+      POSTGRES_PASSWORD: zranexus_dev_password
+      POSTGRES_DB: zranexus
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7
+    container_name: zranexus-redis
+    restart: unless-stopped
+    ports:
+      - "6380:6379"
+
+  backend:
+    build: ../backend
+    container_name: zranexus-backend
+    restart: unless-stopped
+    depends_on:
+      - db
+      - redis
+    environment:
+      DATABASE_URL: postgresql://zranexus:zranexus_dev_password@db:5432/zranexus
+      SECRET_KEY: change-moi-en-production-cle-secrete-zranexus
+      ALGORITHM: HS256
+      ACCESS_TOKEN_EXPIRE_MINUTES: 60
+      REDIS_URL: redis://redis:6379/0
+      ZABBIX_WEBHOOK_SECRET: une-cle-secrete-a-changer-plus-tard
+      SMTP_HOST: smtp.gmail.com
+      SMTP_PORT: 587
+      SMTP_USER: ulrich51zra@gmail.com
+      SMTP_PASSWORD: jceldlwxsyqyamzo
+      SMTP_FROM: ulrich51zra@gmail.com
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../backend/uploads:/app/uploads
+  worker:
+    build: ../backend
+    container_name: zranexus-worker
+    restart: unless-stopped
+    depends_on:
+      - db
+      - redis
+    environment:
+      DATABASE_URL: postgresql://zranexus:zranexus_dev_password@db:5432/zranexus
+      SECRET_KEY: change-moi-en-production-cle-secrete-zranexus
+      ALGORITHM: HS256
+      ACCESS_TOKEN_EXPIRE_MINUTES: 60
+      REDIS_URL: redis://redis:6379/0
+      ZABBIX_WEBHOOK_SECRET: une-cle-secrete-a-changer-plus-tard
+      SMTP_HOST: smtp.gmail.com
+      SMTP_PORT: 587
+      SMTP_USER: ulrich51zra@gmail.com
+      SMTP_PASSWORD: jceldlwxsyqyamzo
+      SMTP_FROM: ulrich51zra@gmail.com
+    command: celery -A app.celery_app worker --loglevel=info --pool=solo
+    volumes:
+      - ../backend/uploads:/app/uploads
+
+  beat:
+    build: ../backend
+    container_name: zranexus-beat
+    restart: unless-stopped
+    depends_on:
+      - db
+      - redis
+    environment:
+      DATABASE_URL: postgresql://zranexus:zranexus_dev_password@db:5432/zranexus
+      SECRET_KEY: change-moi-en-production-cle-secrete-zranexus
+      ALGORITHM: HS256
+      ACCESS_TOKEN_EXPIRE_MINUTES: 60
+      REDIS_URL: redis://redis:6379/0
+      ZABBIX_WEBHOOK_SECRET: une-cle-secrete-a-changer-plus-tard
+      SMTP_HOST: smtp.gmail.com
+      SMTP_PORT: 587
+      SMTP_USER: ulrich51zra@gmail.com
+      SMTP_PASSWORD: jceldlwxsyqyamzo
+      SMTP_FROM: ulrich51zra@gmail.com
+    command: celery -A app.celery_app beat --loglevel=info  
+  frontend:
+    build: ../frontend
+    container_name: zranexus-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "8082:80"    
+volumes:
+  db_data:

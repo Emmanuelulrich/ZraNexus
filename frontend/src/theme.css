@@ -1,0 +1,49 @@
+:root {
+  color-scheme: light;
+  --text: #334155;
+  --text-h: #0c4a6e;
+  --bg: #ffffff;
+  --border: #bae6fd;
+
+  --bleu-clair: #38bdf8;
+  --bleu-principal: #0ea5e9;
+  --bleu-fonce: #0369a1;
+  --blanc: #ffffff;
+  --gris-texte: #334155;
+  --gris-clair: #f0f9ff;
+}
+
+body {
+  background-color: var(--blanc);
+  color: var(--gris-texte);
+}
+
+input, select, textarea {
+  color-scheme: light;
+  background-color: white;
+  color: #334155;
+  border: 1px solid #bae6fd;
+  border-radius: 6px;
+}
+
+.btn-theme {
+  background-color: var(--bleu-principal);
+  color: var(--blanc);
+  border: none;
+  border-radius: 20px;
+  padding: 8px 16px;
+  font-weight: bold;
+  cursor: pointer;
+  box-shadow: 0 2px 6px rgba(14, 165, 233, 0.3);
+}
+
+.btn-theme:hover {
+  background-color: var(--bleu-fonce);
+}
+
+.panneau-theme {
+  background: var(--blanc);
+  border: 1px solid var(--bleu-clair);
+  border-radius: 8px;
+  box-shadow: 0 2px 10px rgba(14, 165, 233, 0.2);
+}
