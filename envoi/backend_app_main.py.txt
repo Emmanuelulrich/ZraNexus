@@ -13,8 +13,7 @@ from app.models import alerte_zabbix
 from app.models import serveur_zabbix
 from app.models import config_notification
 from app.models import journal_activite
-from app.models import position_topologie
-from app.routes import auth, users, sites, type_equipements, equipements, liaisons, permissions, alertes, serveurs_zabbix, config_notifications, topologie, journal_activite as journal_activite_routes
+from app.routes import auth, users, sites, type_equipements, equipements, liaisons, permissions, alertes, serveurs_zabbix, config_notifications, journal_activite as journal_activite_routes
 from app.auth.security import SECRET_KEY, ALGORITHM
 from app.models.journal_activite import JournalActivite
 
@@ -30,17 +29,6 @@ if engine.dialect.name == "postgresql":
             connexion.execute(text("ALTER TABLE serveurs_zabbix ADD COLUMN IF NOT EXISTS equipement_id INTEGER REFERENCES equipements(id) ON DELETE SET NULL"))
     except Exception as erreur_migration:
         print(f"[migration serveurs_zabbix] ignorée : {erreur_migration}")
-
-# Mise à jour automatique de la table liaisons_inter_site (interfaces, débit, sous-réseau)
-if engine.dialect.name == "postgresql":
-    try:
-        with engine.begin() as connexion:
-            connexion.execute(text("ALTER TABLE liaisons_inter_site ADD COLUMN IF NOT EXISTS interface_source VARCHAR(50)"))
-            connexion.execute(text("ALTER TABLE liaisons_inter_site ADD COLUMN IF NOT EXISTS interface_destination VARCHAR(50)"))
-            connexion.execute(text("ALTER TABLE liaisons_inter_site ADD COLUMN IF NOT EXISTS debit VARCHAR(30)"))
-            connexion.execute(text("ALTER TABLE liaisons_inter_site ADD COLUMN IF NOT EXISTS sous_reseau VARCHAR(45)"))
-    except Exception as erreur_migration:
-        print(f"[migration liaisons_inter_site] ignorée : {erreur_migration}")
 
 app = FastAPI(title="ZraNexus API")
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
@@ -109,7 +97,6 @@ app.include_router(sites.router)
 app.include_router(type_equipements.router)
 app.include_router(equipements.router)
 app.include_router(liaisons.router)
-app.include_router(topologie.router)
 app.include_router(permissions.router)
 app.include_router(alertes.router)
 app.include_router(serveurs_zabbix.router)

@@ -1,7 +1,6 @@
 ﻿import { BrowserRouter, Routes, Route } from "react-router-dom";
 import Dashboard from "./pages/Dashboard";
 import NetworkMap from "./pages/NetworkMap";
-import Topologie from "./pages/Topologie";
 import Login from "./pages/Login";
 import ServeursZabbix from "./pages/ServeursZabbix";
 import ConfigNotifications from "./pages/ConfigNotifications";
@@ -29,14 +28,6 @@ function App() {
           element={
             <ProtectedRoute>
               <NetworkMap />
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/topologie"
-          element={
-            <ProtectedRoute>
-              <Topologie />
             </ProtectedRoute>
           }
         />

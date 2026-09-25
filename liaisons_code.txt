@@ -1,12 +1,385 @@
+﻿
+===== I:\ZraNexus\backend\app\models\liaison_inter_site.py =====
+
+from sqlalchemy import Column, Integer, String, ForeignKey
+from sqlalchemy.orm import relationship
+
+from app.database import Base
+
+
+class LiaisonInterSite(Base):
+    __tablename__ = "liaisons_inter_site"
+
+    id = Column(Integer, primary_key=True, index=True)
+    equipement_source_id = Column(Integer, ForeignKey("equipements.id"), nullable=False)
+    equipement_destination_id = Column(Integer, ForeignKey("equipements.id"), nullable=False)
+    type_liaison = Column(String, nullable=True)
+    description = Column(String, nullable=True)
+
+    equipement_source = relationship("Equipement", foreign_keys=[equipement_source_id])
+    equipement_destination = relationship("Equipement", foreign_keys=[equipement_destination_id])
+
+===== I:\ZraNexus\backend\app\routes\liaisons.py =====
+
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.models.liaison_inter_site import LiaisonInterSite
+from app.schemas.liaison_inter_site import LiaisonInterSiteCreate, LiaisonInterSiteOut
+from app.auth.security import get_current_user
+
+router = APIRouter(prefix="/api/liaisons", tags=["liaisons"])
+
+
+@router.get("/", response_model=list[LiaisonInterSiteOut])
+def list_liaisons(db: Session = Depends(get_db), current_user=Depends(get_current_user)):
+    return db.query(LiaisonInterSite).all()
+
+
+@router.post("/", response_model=LiaisonInterSiteOut)
+def create_liaison(liaison_in: LiaisonInterSiteCreate, db: Session = Depends(get_db), current_user=Depends(get_current_user)):
+    new_liaison = LiaisonInterSite(**liaison_in.dict())
+    db.add(new_liaison)
+    db.commit()
+    db.refresh(new_liaison)
+    return new_liaison
+
+
+@router.get("/{liaison_id}", response_model=LiaisonInterSiteOut)
+def get_liaison(liaison_id: int, db: Session = Depends(get_db), current_user=Depends(get_current_user)):
+    liaison = db.query(LiaisonInterSite).filter(LiaisonInterSite.id == liaison_id).first()
+    if not liaison:
+        raise HTTPException(status_code=404, detail="Liaison introuvable")
+    return liaison
+
+
+@router.delete("/{liaison_id}")
+def delete_liaison(liaison_id: int, db: Session = Depends(get_db), current_user=Depends(get_current_user)):
+    liaison = db.query(LiaisonInterSite).filter(LiaisonInterSite.id == liaison_id).first()
+    if not liaison:
+        raise HTTPException(status_code=404, detail="Liaison introuvable")
+
+    db.delete(liaison)
+    db.commit()
+    return {"detail": "Liaison supprimÃ©e"}
+
+===== I:\ZraNexus\backend\app\schemas\liaison_inter_site.py =====
+
+from pydantic import BaseModel
+
+
+class LiaisonInterSiteCreate(BaseModel):
+    equipement_source_id: int
+    equipement_destination_id: int
+    type_liaison: str | None = None
+    description: str | None = None
+
+
+class LiaisonInterSiteOut(BaseModel):
+    id: int
+    equipement_source_id: int
+    equipement_destination_id: int
+    type_liaison: str | None = None
+    description: str | None = None
+
+    class Config:
+        from_attributes = True
+
+===== I:\ZraNexus\backend\app\tasks\ping_equipements.py =====
+
+from icmplib import ping as icmp_ping
+
+from app.celery_app import celery_app
+from app.database import SessionLocal
+from app.models import site, type_equipement, equipement, historique_statut, liaison_inter_site, user, permission
+from app.models.equipement import Equipement
+from app.models.historique_statut import HistoriqueStatut
+
+
+@celery_app.task(name="app.tasks.ping_equipements.ping_tous_les_equipements")
+def ping_tous_les_equipements():
+    db = SessionLocal()
+    try:
+        equipements = db.query(Equipement).filter(Equipement.adresse_ip.isnot(None)).all()
+
+        for equipement_obj in equipements:
+            try:
+                resultat = icmp_ping(equipement_obj.adresse_ip, count=2, timeout=1, privileged=False)
+                nouveau_statut = "disponible" if resultat.is_alive else "indisponible"
+            except Exception:
+                nouveau_statut = "indisponible"
+
+            if nouveau_statut != equipement_obj.statut:
+                historique = HistoriqueStatut(
+                    equipement_id=equipement_obj.id,
+                    ancien_statut=equipement_obj.statut,
+                    nouveau_statut=nouveau_statut,
+                )
+                db.add(historique)
+                equipement_obj.statut = nouveau_statut
+
+        db.commit()
+        return {"equipements_verifies": len(equipements)}
+    finally:
+        db.close()
+
+===== I:\ZraNexus\backend\app\main.py =====
+
+from fastapi import FastAPI, Request
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from jose import jwt, JWTError
+from sqlalchemy import text
+
+from app.database import Base, engine, SessionLocal
+from app.models import user
+from app.models import site, type_equipement, equipement, historique_statut, liaison_inter_site
+from app.models import permission
+from app.models import alerte_zabbix
+from app.models import serveur_zabbix
+from app.models import config_notification
+from app.models import journal_activite
+from app.routes import auth, users, sites, type_equipements, equipements, liaisons, permissions, alertes, serveurs_zabbix, config_notifications, journal_activite as journal_activite_routes
+from app.auth.security import SECRET_KEY, ALGORITHM
+from app.models.journal_activite import JournalActivite
+
+Base.metadata.create_all(bind=engine)
+
+# Mise Ã  jour automatique de la table serveurs_zabbix (nouvelles colonnes : MAC, site, Ã©quipement liÃ©)
+# sans toucher aux donnÃ©es existantes. Sans effet si les colonnes existent dÃ©jÃ .
+if engine.dialect.name == "postgresql":
+    try:
+        with engine.begin() as connexion:
+            connexion.execute(text("ALTER TABLE serveurs_zabbix ADD COLUMN IF NOT EXISTS adresse_mac VARCHAR(17)"))
+            connexion.execute(text("ALTER TABLE serveurs_zabbix ADD COLUMN IF NOT EXISTS site_id INTEGER REFERENCES sites(id)"))
+            connexion.execute(text("ALTER TABLE serveurs_zabbix ADD COLUMN IF NOT EXISTS equipement_id INTEGER REFERENCES equipements(id) ON DELETE SET NULL"))
+    except Exception as erreur_migration:
+        print(f"[migration serveurs_zabbix] ignorÃ©e : {erreur_migration}")
+
+app = FastAPI(title="ZraNexus API")
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+
+app.add_middleware(
+    CORSMiddleware,
+  allow_origins=[
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:8081",
+    "http://127.0.0.1:8081",
+    "http://localhost:8080",
+    "http://127.0.0.1:8080",
+    "http://10.243.22.183:8080",
+    "http://localhost:8082",
+    "http://127.0.0.1:8082",
+    "http://10.243.22.183:8082",
+],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class JournalActiviteMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+
+        if request.method == "OPTIONS":
+            return response
+
+        try:
+            identifiant = None
+            auth_header = request.headers.get("authorization")
+            if auth_header and auth_header.lower().startswith("bearer "):
+                token = auth_header.split(" ", 1)[1]
+                try:
+                    payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+                    identifiant = payload.get("sub")
+                except JWTError:
+                    identifiant = None
+
+            db = SessionLocal()
+            try:
+                entree = JournalActivite(
+                    utilisateur_identifiant=identifiant,
+                    methode=request.method,
+                    chemin=request.url.path,
+                    adresse_ip=request.client.host if request.client else None,
+                    code_statut=response.status_code,
+                )
+                db.add(entree)
+                db.commit()
+            finally:
+                db.close()
+        except Exception:
+            pass
+
+        return response
+
+
+app.add_middleware(JournalActiviteMiddleware)
+
+app.include_router(auth.router)
+app.include_router(users.router)
+app.include_router(sites.router)
+app.include_router(type_equipements.router)
+app.include_router(equipements.router)
+app.include_router(liaisons.router)
+app.include_router(permissions.router)
+app.include_router(alertes.router)
+app.include_router(serveurs_zabbix.router)
+app.include_router(config_notifications.router)
+app.include_router(journal_activite_routes.router)
+
+
+@app.get("/")
+def read_root():
+    return {"message": "ZraNexus API en ligne"}
+
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
+
+===== I:\ZraNexus\frontend\src\pages\JournalActivite.jsx =====
+
+import { useEffect, useState } from "react";
+import api from "../services/api";
+
+function JournalActivite() {
+  const [entrees, setEntrees] = useState([]);
+  const [erreur, setErreur] = useState("");
+
+  const token = localStorage.getItem("token");
+  const headers = { Authorization: `Bearer ${token}` };
+
+  const chargerJournal = async () => {
+    try {
+      const res = await api.get("/api/journal/", { headers });
+      setEntrees(res.data);
+    } catch (err) {
+      if (err.response?.status === 403) {
+        setErreur("AccÃ¨s rÃ©servÃ© aux administrateurs.");
+      } else {
+        setErreur("Impossible de charger le journal.");
+      }
+    }
+  };
+
+  useEffect(() => {
+    chargerJournal();
+  }, []);
+
+  const traduireAction = (methode, chemin) => {
+  const regles = [
+    { regex: /^\/auth\/login$/, label: "Connexion" },
+    { regex: /^\/auth\/register$/, label: "CrÃ©ation de compte" },
+    { regex: /^\/users\/me$/, label: "Consultation du profil" },
+
+    { regex: /^\/api\/sites\/stats\/?$/, label: "Statistiques des sites" },
+    { regex: /^\/api\/sites\/\d+\/plan\/?$/, label: "Upload du plan de site" },
+    { regex: /^\/api\/sites\/\d+\/?$/, methode: "GET", label: "Consultation d'un site" },
+    { regex: /^\/api\/sites\/\d+\/?$/, methode: "PUT", label: "Modification d'un site" },
+    { regex: /^\/api\/sites\/\d+\/?$/, methode: "DELETE", label: "Suppression d'un site" },
+    { regex: /^\/api\/sites\/?$/, methode: "GET", label: "Liste des sites" },
+    { regex: /^\/api\/sites\/?$/, methode: "POST", label: "CrÃ©ation d'un site" },
+
+    { regex: /^\/api\/type-equipements\/?$/, label: "Types d'Ã©quipements" },
+
+    { regex: /^\/api\/equipements\/stats\/?$/, label: "Statistiques des Ã©quipements" },
+    { regex: /^\/api\/equipements\/scan\/?$/, label: "Scan de plage IP" },
+    { regex: /^\/api\/equipements\/\d+\/historique\/?$/, label: "Historique d'un Ã©quipement" },
+    { regex: /^\/api\/equipements\/\d+\/ping\/?$/, label: "Ping d'un Ã©quipement" },
+    { regex: /^\/api\/equipements\/\d+\/?$/, methode: "GET", label: "Consultation d'un Ã©quipement" },
+    { regex: /^\/api\/equipements\/\d+\/?$/, methode: "PUT", label: "Modification d'un Ã©quipement" },
+    { regex: /^\/api\/equipements\/\d+\/?$/, methode: "DELETE", label: "Suppression d'un Ã©quipement" },
+    { regex: /^\/api\/equipements\/?$/, methode: "GET", label: "Liste des Ã©quipements" },
+    { regex: /^\/api\/equipements\/?$/, methode: "POST", label: "CrÃ©ation d'un Ã©quipement" },
+
+    { regex: /^\/api\/liaisons\/\d+\/?$/, methode: "DELETE", label: "Suppression d'une liaison" },
+    { regex: /^\/api\/liaisons\/?$/, methode: "GET", label: "Liste des liaisons" },
+    { regex: /^\/api\/liaisons\/?$/, methode: "POST", label: "CrÃ©ation d'une liaison" },
+
+    { regex: /^\/api\/permissions\/?$/, label: "Gestion des permissions" },
+
+    { regex: /^\/api\/alertes\/zabbix\/?$/, label: "RÃ©ception d'une alerte Zabbix" },
+    { regex: /^\/api\/alertes\/\d+\/resoudre\/?$/, label: "RÃ©solution d'une alerte" },
+    { regex: /^\/api\/alertes\/?$/, label: "Liste des alertes" },
+
+    { regex: /^\/api\/serveurs-zabbix\/?/, label: "Gestion des serveurs Zabbix" },
+    { regex: /^\/api\/config-notifications\/?/, label: "Configuration des notifications" },
+    { regex: /^\/api\/journal\/?$/, label: "Consultation du journal d'activitÃ©" },
+
+    { regex: /^\/uploads\//, label: "Chargement d'un fichier (plan / icÃ´ne)" },
+  ];
+
+  const regle = regles.find(
+    (r) => r.regex.test(chemin) && (!r.methode || r.methode === methode)
+  );
+
+  return regle ? regle.label : `${methode} ${chemin}`;
+};
+  const couleurCode = (code) => {
+    if (!code) return "#999";
+    if (code >= 200 && code < 300) return "#2ecc71";
+    if (code === 307 || code === 308) return "#95a5a6";
+    if (code === 401 || code === 403) return "#e67e22";
+    if (code >= 400) return "#e74c3c";
+    return "#999";
+  };
+
+  return (
+    <div style={{ padding: "20px" }}>
+      <h2>Journal d'activitÃ©</h2>
+      <p style={{ fontSize: "13px", color: "#666" }}>
+        Les 500 derniÃ¨res actions effectuÃ©es sur l'application (connexions, requÃªtes API).
+      </p>
+      {erreur && <p style={{ color: "red" }}>{erreur}</p>}
+
+      <table style={{ width: "100%", borderCollapse: "collapse", marginTop: "16px", fontSize: "13px" }}>
+        <thead>
+          <tr style={{ borderBottom: "2px solid #ccc", textAlign: "left" }}>
+            <th style={{ padding: "8px" }}>Date</th>
+            <th style={{ padding: "8px" }}>Utilisateur</th>
+            
+            <th style={{ padding: "8px" }}>Chemin</th>
+            <th style={{ padding: "8px" }}>IP</th>
+            <th style={{ padding: "8px" }}>Statut</th>
+          </tr>
+        </thead>
+        <tbody>
+          {entrees.map((e) => (
+            <tr key={e.id} style={{ borderBottom: "1px solid #eee" }}>
+              <td style={{ padding: "8px" }}>{new Date(e.date_creation).toLocaleString()}</td>
+              <td style={{ padding: "8px" }}>{e.utilisateur_identifiant || "â€”"}</td>
+              
+              <td style={{ padding: "8px" }}>
+  {traduireAction(e.methode, e.chemin)}
+  <span style={{ color: "#777", fontSize: "11px", marginLeft: "6px" }}>
+    ({e.methode})
+  </span>
+</td>
+              <td style={{ padding: "8px" }}>{e.adresse_ip || "â€”"}</td>
+              <td style={{ padding: "8px", color: couleurCode(e.code_statut), fontWeight: "bold" }}>
+                {e.code_statut || "â€”"}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+export default JournalActivite;
+
+===== I:\ZraNexus\frontend\src\pages\NetworkMap.jsx =====
+
 import { useEffect, useState, useRef } from "react";
 import { MapContainer, TileLayer, LayersControl, ZoomControl, Marker, Popup, Polyline, Circle, useMapEvents, useMap } from "react-leaflet";
 import L from "leaflet";
 import api from "../services/api";
 import html2canvas from "html2canvas";
-import LegendeLiaisons from "../components/LegendeLiaisons";
-import TraitLiaisonCarte from "../components/TraitLiaisonCarte";
-import { TYPES_LIAISON, libelleLiaison, categorieLiaison, LIBELLE_CATEGORIE } from "../utils/liaisonTypes";
-import { useNavigate } from "react-router-dom";
 const SEUIL_ZOOM_EQUIPEMENT = 15;
 const API_URL = import.meta.env.VITE_API_URL;
 
@@ -39,13 +412,13 @@ function ControleurVue({ cible }) {
   return null;
 }
 
-// Lien Google Maps : ouvre l'itinéraire vers le site (appli Google Maps sur téléphone), sans clé API
+// Lien Google Maps : ouvre l'itinÃ©raire vers le site (appli Google Maps sur tÃ©lÃ©phone), sans clÃ© API
 function lienItineraire(lat, lng) {
   return `https://www.google.com/maps/dir/?api=1&destination=${lat},${lng}`;
 }
 
-// Copie dans le presse-papiers. Sur une page en http (non sécurisée), navigator.clipboard n'existe pas :
-// on utilise donc une méthode de secours.
+// Copie dans le presse-papiers. Sur une page en http (non sÃ©curisÃ©e), navigator.clipboard n'existe pas :
+// on utilise donc une mÃ©thode de secours.
 async function copierTexte(texte) {
   try {
     if (navigator.clipboard && window.isSecureContext) {
@@ -53,7 +426,7 @@ async function copierTexte(texte) {
       return true;
     }
   } catch (e) {
-    // on tente la méthode de secours ci-dessous
+    // on tente la mÃ©thode de secours ci-dessous
   }
   try {
     const zone = document.createElement("textarea");
@@ -85,8 +458,8 @@ function messageApi(err, defaut) {
   return typeof detail === "string" ? detail : defaut;
 }
 
-// Prépare les données d'un équipement pour l'API : chaînes vides -> null, nombres convertis.
-// Le statut n'est jamais envoyé : il est déterminé automatiquement par ping.
+// PrÃ©pare les donnÃ©es d'un Ã©quipement pour l'API : chaÃ®nes vides -> null, nombres convertis.
+// Le statut n'est jamais envoyÃ© : il est dÃ©terminÃ© automatiquement par ping.
 function nettoyerEquipement(form) {
   const propre = { ...form };
   ["adresse_ip", "adresse_mac"].forEach((champ) => {
@@ -106,7 +479,7 @@ function nettoyerMac(texte) {
   return (texte || "").toLowerCase().replace(/[^0-9a-f]/g, "");
 }
 
-// Recherche parmi les sites et équipements déjà chargés : nom, adresse IP ou adresse MAC
+// Recherche parmi les sites et Ã©quipements dÃ©jÃ  chargÃ©s : nom, adresse IP ou adresse MAC
 function rechercherLocal(requete, sites, equipements) {
   const q = normaliser(requete);
   const brut = (requete || "").trim();
@@ -133,7 +506,7 @@ function rechercherLocal(requete, sites, equipements) {
       genre: "equipement",
       id: eq.id,
       titre: eq.nom,
-      detail: [eq.adresse_ip, eq.adresse_mac].filter(Boolean).join(" · "),
+      detail: [eq.adresse_ip, eq.adresse_mac].filter(Boolean).join(" Â· "),
     }));
 
   return [...resSites, ...resEquipements].slice(0, 12);
@@ -151,56 +524,9 @@ async function chercherLieux(requete) {
   }));
 }
 
-// Contenu de la fenêtre d'une liaison (type, catégorie, interfaces, débit, sous-réseau)
-function DetailsLiaison({ liaison, titre, sousTitre, onSupprimer }) {
-  const categorie = categorieLiaison(liaison.type_liaison);
-  return (
-    <div style={{ minWidth: "210px" }}>
-      <strong>{titre}</strong>
-      {sousTitre && (
-        <>
-          <br />
-          <span style={{ color: "#555" }}>{sousTitre}</span>
-        </>
-      )}
-      <br />
-      Type : {libelleLiaison(liaison.type_liaison)}
-      {categorie ? ` (${LIBELLE_CATEGORIE[categorie].toLowerCase()})` : ""}
-      {(liaison.interface_source || liaison.interface_destination) && (
-        <>
-          <br />
-          Interfaces : {liaison.interface_source || "?"} ↔ {liaison.interface_destination || "?"}
-        </>
-      )}
-      {liaison.debit && (
-        <>
-          <br />
-          Débit : {liaison.debit}
-        </>
-      )}
-      {liaison.sous_reseau && (
-        <>
-          <br />
-          Sous-réseau : {liaison.sous_reseau}
-        </>
-      )}
-      {liaison.description && (
-        <>
-          <br />
-          {liaison.description}
-        </>
-      )}
-      <br />
-      <button onClick={onSupprimer} style={{ marginTop: "6px", color: "red" }}>
-        Supprimer la liaison
-      </button>
-    </div>
-  );
-}
-
 function graviteInfo(alertes) {
-  const ordre = { catastrophe: 5, disaster: 5, elevee: 4, "élevée": 4, high: 4, moyenne: 3, average: 3, avertissement: 2, warning: 2, information: 1 };
-  const couleurs = { catastrophe: "#8e0000", disaster: "#8e0000", elevee: "#e74c3c", "élevée": "#e74c3c", high: "#e74c3c", moyenne: "#f39c12", average: "#f39c12", avertissement: "#f1c40f", warning: "#f1c40f", information: "#3498db" };
+  const ordre = { catastrophe: 5, disaster: 5, elevee: 4, "Ã©levÃ©e": 4, high: 4, moyenne: 3, average: 3, avertissement: 2, warning: 2, information: 1 };
+  const couleurs = { catastrophe: "#8e0000", disaster: "#8e0000", elevee: "#e74c3c", "Ã©levÃ©e": "#e74c3c", high: "#e74c3c", moyenne: "#f39c12", average: "#f39c12", avertissement: "#f1c40f", warning: "#f1c40f", information: "#3498db" };
 
   let meilleureCle = null;
   let meilleurScore = 0;
@@ -254,7 +580,7 @@ function categorieType(libelle) {
   if (t.includes("pare-feu") || t.includes("parefeu") || t.includes("firewall")) return "parefeu";
   return "defaut";
 }
-// Icônes PNG (dossier frontend/public/icons/) associées à chaque catégorie détectée par categorieType()
+// IcÃ´nes PNG (dossier frontend/public/icons/) associÃ©es Ã  chaque catÃ©gorie dÃ©tectÃ©e par categorieType()
 const ICONES_PAR_CATEGORIE = {
     nvr: "/icons/nvr.png",
   dvr: "/icons/dvr.png",
@@ -324,8 +650,8 @@ function creerIconeEquipement(statut, alertesEq, typeLibelle, iconePersonnalisee
   });
 }
 
-// Marqueur de site : divIcon en HTML/CSS (aucune image), pour éviter l'icône par défaut de Leaflet
-// dont les fichiers PNG ne sont pas retrouvés une fois l'application compilée.
+// Marqueur de site : divIcon en HTML/CSS (aucune image), pour Ã©viter l'icÃ´ne par dÃ©faut de Leaflet
+// dont les fichiers PNG ne sont pas retrouvÃ©s une fois l'application compilÃ©e.
 function creerIconeSite(alertesSite) {
   const aUneAlerte = alertesSite.length > 0;
   const info = aUneAlerte ? graviteInfo(alertesSite) : null;
@@ -355,7 +681,7 @@ function creerIconeSite(alertesSite) {
   });
 }
 
-// Marqueur temporaire du lieu trouvé par la recherche (rouge, sans image)
+// Marqueur temporaire du lieu trouvÃ© par la recherche (rouge, sans image)
 function creerIconeRecherche() {
   return L.divIcon({
     className: "",
@@ -409,7 +735,6 @@ async function geocoderAdresse(quartier, ville, pays) {
 }
 
 function NetworkMap() {
-  const navigate = useNavigate();
   const [sites, setSites] = useState([]);
   const [equipements, setEquipements] = useState([]);
   const [types, setTypes] = useState([]);
@@ -459,10 +784,6 @@ const [scanEnCours, setScanEnCours] = useState(false);
     equipement_source_id: "",
     equipement_destination_id: "",
     type_liaison: "",
-    interface_source: "",
-    interface_destination: "",
-    debit: "",
-    sous_reseau: "",
     description: "",
   });
    const [afficherUniquementSites, setAfficherUniquementSites] = useState(false);
@@ -472,11 +793,12 @@ const [scanEnCours, setScanEnCours] = useState(false);
 
    const [requeteRecherche, setRequeteRecherche] = useState("");
    const [resultatsRecherche, setResultatsRecherche] = useState([]);
+   const [rechercheEnCours, setRechercheEnCours] = useState(false);
    const [messageRecherche, setMessageRecherche] = useState("");
    const [lieuRecherche, setLieuRecherche] = useState(null);
    const [cibleVue, setCibleVue] = useState(null);
    const [messageCopie, setMessageCopie] = useState("");
-   const [lieuxChargement, setLieuxChargement] = useState(false);
+   const [modeRecherche, setModeRecherche] = useState("interne");
    const [hauteurCarte, setHauteurCarte] = useState(null);
    const conteneurRef = useRef(null);
    const refsMarqueurs = useRef({});
@@ -499,13 +821,13 @@ const [scanEnCours, setScanEnCours] = useState(false);
       setLiaisons(liaisonsRes.data);
       setAlertes(alertesRes.data);
     } catch (err) {
-      setErreur("Impossible de charger les données.");
+      setErreur("Impossible de charger les donnÃ©es.");
     }
   };
 
   useEffect(() => {
     chargerDonnees();
-    // Les statuts (mis à jour par le ping automatique) sont rechargés toutes les 30 secondes
+    // Les statuts (mis Ã  jour par le ping automatique) sont rechargÃ©s toutes les 30 secondes
     const minuteur = setInterval(chargerDonnees, 30000);
     return () => clearInterval(minuteur);
   }, []);
@@ -531,8 +853,8 @@ const [scanEnCours, setScanEnCours] = useState(false);
   const basculerPleinEcran = () => {
     if (!document.fullscreenElement) {
       mapWrapperRef.current.requestFullscreen().catch((err) => {
-        console.error("Erreur plein écran :", err);
-        setErreur("Impossible d'activer le plein écran : " + err.message);
+        console.error("Erreur plein Ã©cran :", err);
+        setErreur("Impossible d'activer le plein Ã©cran : " + err.message);
       });
     } else {
       document.exitFullscreen();
@@ -547,7 +869,7 @@ const [scanEnCours, setScanEnCours] = useState(false);
       if (site && site.latitude && site.longitude) position = [site.latitude, site.longitude];
       cle = `site-${res.id}`;
     } else {
-      // On lève les filtres qui pourraient masquer l'équipement recherché
+      // On lÃ¨ve les filtres qui pourraient masquer l'Ã©quipement recherchÃ©
       setAfficherUniquementSites(false);
       setFiltreType("");
       setFiltreSite("");
@@ -556,7 +878,7 @@ const [scanEnCours, setScanEnCours] = useState(false);
       cle = `eq-${res.id}`;
     }
     if (!position) {
-      setMessageRecherche("Cet élément n'a pas de position sur la carte (site sans coordonnées).");
+      setMessageRecherche("Cet Ã©lÃ©ment n'a pas de position sur la carte (site sans coordonnÃ©es).");
       return;
     }
     setMessageRecherche("");
@@ -568,40 +890,31 @@ const [scanEnCours, setScanEnCours] = useState(false);
     }, 1500);
   };
 
-  // Recherche locale (sites/équipements) instantanée + recherche de lieux (Nominatim) après une pause de frappe
-  useEffect(() => {
+  const lancerRecherche = async (e) => {
+    e.preventDefault();
     const requete = requeteRecherche.trim();
-    const ressembleIpOuMac = /^[0-9a-f:.\-]+$/i.test(requete) && /\d/.test(requete);
-    if (requete.length < 3 || ressembleIpOuMac) {
-      setResultatsRecherche([]);
-      setLieuxChargement(false);
+    if (!requete) return;
+
+    // Recherche parmi les sites et Ã©quipements : EntrÃ©e ouvre le premier rÃ©sultat
+    if (modeRecherche === "interne") {
+      const trouves = rechercherLocal(requete, sites, equipements);
+      if (trouves.length > 0) choisirInterne(trouves[0]);
       return;
     }
-    setLieuxChargement(true);
-    let annule = false;
-    const minuteur = setTimeout(async () => {
-      try {
-        const lieux = await chercherLieux(requete);
-        if (!annule) setResultatsRecherche(lieux);
-      } catch (err) {
-        if (!annule) setMessageRecherche("Lieux : recherche impossible, vérifie la connexion Internet.");
-      } finally {
-        if (!annule) setLieuxChargement(false);
-      }
-    }, 450);
-    return () => {
-      annule = true;
-      clearTimeout(minuteur);
-    };
-  }, [requeteRecherche]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Entrée : ouvre le premier résultat (site/équipement en priorité, sinon premier lieu)
-  const lancerRecherche = (e) => {
-    e.preventDefault();
-    if (resultatsInternes.length > 0) {
-      choisirInterne(resultatsInternes[0]);
-    } else if (resultatsRecherche.length > 0) {
-      choisirLieu(resultatsRecherche[0]);
+    setRechercheEnCours(true);
+    setMessageRecherche("");
+    setResultatsRecherche([]);
+    try {
+      const lieux = await chercherLieux(requete);
+      if (lieux.length === 0) {
+        setMessageRecherche("Aucun lieu trouvÃ©. Essaie avec le quartier et la ville (ex : Deido, Douala).");
+      }
+      setResultatsRecherche(lieux);
+    } catch (err) {
+      setMessageRecherche("Recherche impossible : vÃ©rifie la connexion Internet.");
+    } finally {
+      setRechercheEnCours(false);
     }
   };
 
@@ -615,14 +928,13 @@ const [scanEnCours, setScanEnCours] = useState(false);
   const effacerRecherche = () => {
     setRequeteRecherche("");
     setResultatsRecherche([]);
-    setLieuxChargement(false);
     setMessageRecherche("");
     setLieuRecherche(null);
   };
 
   const copierCoordonnees = async (lat, lng) => {
     const ok = await copierTexte(`${lat}, ${lng}`);
-    setMessageCopie(ok ? "Coordonnées copiées ✔" : "Copie impossible sur cet appareil");
+    setMessageCopie(ok ? "CoordonnÃ©es copiÃ©es âœ”" : "Copie impossible sur cet appareil");
     setTimeout(() => setMessageCopie(""), 2500);
   };
 
@@ -664,7 +976,7 @@ const lancerPing = async (equipement) => {
       await api.put(`/api/alertes/${alerteId}/resoudre`, {}, { headers });
       chargerDonnees();
     } catch (err) {
-      setErreur("Erreur lors de la résolution de l'alerte.");
+      setErreur("Erreur lors de la rÃ©solution de l'alerte.");
     }
   };
 
@@ -689,7 +1001,7 @@ const lancerPing = async (equipement) => {
       setFormSite({ nom: "", pays: "", ville: "", quartier: "" });
       chargerDonnees();
     } catch (err) {
-      setErreur("Adresse introuvable — vérifie le quartier/ville/pays saisis.");
+      setErreur("Adresse introuvable â€” vÃ©rifie le quartier/ville/pays saisis.");
     }
   };
 
@@ -732,12 +1044,12 @@ const lancerPing = async (equipement) => {
       setSiteSelectionne(null);
       chargerDonnees();
     } catch (err) {
-      setErreur(messageApi(err, "Erreur lors de la création de l'équipement."));
+      setErreur(messageApi(err, "Erreur lors de la crÃ©ation de l'Ã©quipement."));
     }
   };
 
   const supprimerEquipement = async (equipement) => {
-    if (!window.confirm(`Supprimer l'équipement "${equipement.nom}" ?`)) return;
+    if (!window.confirm(`Supprimer l'Ã©quipement "${equipement.nom}" ?`)) return;
     try {
       await api.delete(`/api/equipements/${equipement.id}`, { headers });
       chargerDonnees();
@@ -780,7 +1092,7 @@ const lancerPing = async (equipement) => {
       setSiteEnModification(null);
       chargerDonnees();
     } catch (err) {
-      setErreur("Adresse introuvable — vérifie le quartier/ville/pays saisis.");
+      setErreur("Adresse introuvable â€” vÃ©rifie le quartier/ville/pays saisis.");
     }
   };
 
@@ -813,7 +1125,7 @@ const lancerPing = async (equipement) => {
       setEquipementEnModification(null);
       chargerDonnees();
     } catch (err) {
-      setErreur(messageApi(err, "Erreur lors de la modification de l'équipement."));
+      setErreur(messageApi(err, "Erreur lors de la modification de l'Ã©quipement."));
     }
   };
 
@@ -859,20 +1171,15 @@ const handleSubmitScan = async (e) => {
           equipement_source_id: parseInt(formLiaison.equipement_source_id),
           equipement_destination_id: parseInt(formLiaison.equipement_destination_id),
           type_liaison: formLiaison.type_liaison || null,
-          interface_source: formLiaison.interface_source || null,
-          interface_destination: formLiaison.interface_destination || null,
-          debit: formLiaison.debit || null,
-          sous_reseau: formLiaison.sous_reseau || null,
           description: formLiaison.description || null,
         },
         { headers }
       );
       setAfficherFormulaireLiaison(false);
-      setFormLiaison({ equipement_source_id: "", equipement_destination_id: "", type_liaison: "", interface_source: "", interface_destination: "", debit: "", sous_reseau: "", description: "" });
+      setFormLiaison({ equipement_source_id: "", equipement_destination_id: "", type_liaison: "", description: "" });
       chargerDonnees();
     } catch (err) {
-      const detail = err?.response?.data?.detail;
-      setErreur(typeof detail === "string" ? detail : "Erreur lors de la création de la liaison.");
+      setErreur("Erreur lors de la crÃ©ation de la liaison.");
     }
   };
 
@@ -895,7 +1202,7 @@ const handleSubmitScan = async (e) => {
     lien.click();
   });
 };
-  const resultatsInternes = rechercherLocal(requeteRecherche, sites, equipements);
+  const resultatsInternes = modeRecherche === "interne" ? rechercherLocal(requeteRecherche, sites, equipements) : [];
   const centreDefaut = [4.0511, 9.7679];
 
   return (
@@ -944,7 +1251,7 @@ const handleSubmitScan = async (e) => {
           boxShadow: "0 2px 6px rgba(0,0,0,0.3)",
         }}
       >
-        🔗 Nouvelle liaison
+        ðŸ”— Nouvelle liaison
       </button>
             <button
         onClick={() => setAfficherFormulaireScan(true)}
@@ -962,7 +1269,7 @@ const handleSubmitScan = async (e) => {
           boxShadow: "0 2px 6px rgba(0,0,0,0.3)",
         }}
       >
-        📡 Scanner une plage IP
+        ðŸ“¡ Scanner une plage IP
       </button>
       <button
       
@@ -981,7 +1288,7 @@ const handleSubmitScan = async (e) => {
     boxShadow: "0 2px 6px rgba(0,0,0,0.3)",
   }}
 >
-  🔍 Filtres
+  ðŸ” Filtres
 </button>
       
       <button
@@ -1000,7 +1307,7 @@ const handleSubmitScan = async (e) => {
     boxShadow: "0 2px 6px rgba(0,0,0,0.3)",
   }}
 >
-  📷 Exporter en PNG
+  ðŸ“· Exporter en PNG
 </button>
       <button
         onClick={basculerPleinEcran}
@@ -1018,25 +1325,7 @@ const handleSubmitScan = async (e) => {
           boxShadow: "0 2px 6px rgba(0,0,0,0.3)",
         }}
       >
-        {pleinEcran ? "🡼 Quitter le plein écran" : "⛶ Plein écran"}
-      </button>
-      <button
-        onClick={() => navigate("/topologie")}
-        style={{
-          position: "absolute",
-          top: 260,
-          left: 20,
-          zIndex: 1000,
-          background: "#8e44ad",
-          color: "white",
-          border: "none",
-          borderRadius: "20px",
-          padding: "8px 16px",
-          fontWeight: "bold",
-          boxShadow: "0 2px 6px rgba(0,0,0,0.3)",
-        }}
-      >
-        🕸️ Topologie
+        {pleinEcran ? "ðŸ¡¼ Quitter le plein Ã©cran" : "â›¶ Plein Ã©cran"}
       </button>
       {alertesActives.length > 0 && (
         <button
@@ -1055,7 +1344,7 @@ const handleSubmitScan = async (e) => {
             boxShadow: "0 2px 6px rgba(0,0,0,0.3)",
           }}
         >
-          🔔 {alertesActives.length} alerte{alertesActives.length > 1 ? "s" : ""} active{alertesActives.length > 1 ? "s" : ""}
+          ðŸ”” {alertesActives.length} alerte{alertesActives.length > 1 ? "s" : ""} active{alertesActives.length > 1 ? "s" : ""}
         </button>
       )}
 
@@ -1069,10 +1358,10 @@ const handleSubmitScan = async (e) => {
               const equipement = equipements.find((e) => e.id === a.equipement_id);
               return (
                 <li key={a.id} style={{ marginBottom: "10px", borderLeft: "3px solid #e74c3c", paddingLeft: "8px" }}>
-                  <strong>{a.gravite}</strong> — {a.message}
+                  <strong>{a.gravite}</strong> â€” {a.message}
                   <br />
                   <span style={{ color: "#777" }}>
-                    {equipement ? `Équipement : ${equipement.nom}` : site ? `Site : ${site.nom}` : ""}
+                    {equipement ? `Ã‰quipement : ${equipement.nom}` : site ? `Site : ${site.nom}` : ""}
                   </span>
                   <br />
                   <span style={{ fontSize: "12px", color: "#888" }}>
@@ -1082,7 +1371,7 @@ const handleSubmitScan = async (e) => {
                   <span style={{ color: "#777" }}>{new Date(a.date_creation).toLocaleString()}</span>
                   <br />
                   <button onClick={() => resoudreAlerte(a.id)} style={{ marginTop: "4px" }}>
-                    Marquer comme résolue
+                    Marquer comme rÃ©solue
                   </button>
                 </li>
               );
@@ -1117,7 +1406,7 @@ const handleSubmitScan = async (e) => {
         checked={afficherUniquementSites}
         onChange={(e) => setAfficherUniquementSites(e.target.checked)}
       />
-      Afficher uniquement les sites (masquer les équipements)
+      Afficher uniquement les sites (masquer les Ã©quipements)
     </label>
         <label style={{ display: "flex", alignItems: "center", gap: "6px", marginBottom: "8px", fontSize: "13px" }}>
       <input
@@ -1128,13 +1417,13 @@ const handleSubmitScan = async (e) => {
       Afficher la couverture Wi-Fi
     </label>
     <p style={{ fontSize: "12px", color: "#888" }}>
-      {equipementsFiltres.length} équipement(s) affiché(s) sur {equipements.length}
+      {equipementsFiltres.length} Ã©quipement(s) affichÃ©(s) sur {equipements.length}
     </p>
     <button
       onClick={() => { setFiltreType(""); setFiltreSite(""); setFiltreStatut(""); }}
       style={boutonStyle}
     >
-      Réinitialiser
+      RÃ©initialiser
     </button>
     <button onClick={() => setAfficherFiltres(false)} style={boutonStyle}>Fermer</button>
   </div>
@@ -1143,7 +1432,7 @@ const handleSubmitScan = async (e) => {
         <div style={panneauStyle}>
           <h3>Scanner une plage IP</h3>
           <p style={{ fontSize: "12px", color: "#555" }}>
-            Si "IP fin" est vide, le scan couvre tout le /24 (1 à 254) à partir du préfixe de "IP début".
+            Si "IP fin" est vide, le scan couvre tout le /24 (1 Ã  254) Ã  partir du prÃ©fixe de "IP dÃ©but".
           </p>
           <form onSubmit={handleSubmitScan}>
             <select name="site_id" value={formScan.site_id} onChange={handleChangeScan} required style={inputStyle}>
@@ -1152,7 +1441,7 @@ const handleSubmitScan = async (e) => {
                 <option key={s.id} value={s.id}>{s.nom}</option>
               ))}
             </select>
-            <input name="ip_debut" placeholder="IP début (ex: 192.168.8.1)" value={formScan.ip_debut} onChange={handleChangeScan} required style={inputStyle} />
+            <input name="ip_debut" placeholder="IP dÃ©but (ex: 192.168.8.1)" value={formScan.ip_debut} onChange={handleChangeScan} required style={inputStyle} />
             <input name="ip_fin" placeholder="IP fin (optionnel)" value={formScan.ip_fin} onChange={handleChangeScan} style={inputStyle} />
             <button type="submit" style={boutonStyle} disabled={scanEnCours}>
               {scanEnCours ? "Scan en cours..." : "Lancer le scan"}
@@ -1163,25 +1452,25 @@ const handleSubmitScan = async (e) => {
           </form>
           {resultatScan && (
             <div style={{ marginTop: "10px", fontSize: "13px" }}>
-              <p><strong>{resultatScan.adresses_trouvees.length}</strong> adresse(s) répondent au ping.</p>
-              <p><strong>{resultatScan.equipements_crees.length}</strong> nouvel(aux) équipement(s) créé(s).</p>
+              <p><strong>{resultatScan.adresses_trouvees.length}</strong> adresse(s) rÃ©pondent au ping.</p>
+              <p><strong>{resultatScan.equipements_crees.length}</strong> nouvel(aux) Ã©quipement(s) crÃ©Ã©(s).</p>
               {resultatScan.types_detectes !== undefined && (
-                <p><strong>{resultatScan.types_detectes}</strong> type(s) détecté(s) automatiquement.</p>
+                <p><strong>{resultatScan.types_detectes}</strong> type(s) dÃ©tectÃ©(s) automatiquement.</p>
               )}
-              <p style={{ color: "#888" }}>{resultatScan.adresses_echec.length} adresse(s) sans réponse.</p>
+              <p style={{ color: "#888" }}>{resultatScan.adresses_echec.length} adresse(s) sans rÃ©ponse.</p>
             </div>
           )}
         </div>
       )}
       {afficherFormulaireLiaison && (
-        <div style={{ ...panneauStyle, maxHeight: "85vh", overflowY: "auto" }}>
+        <div style={panneauStyle}>
           <h3>Nouvelle liaison</h3>
           <p style={{ fontSize: "12px", color: "#555" }}>
-            Choisis les deux équipements précis reliés par cette liaison.
+            Choisis les deux Ã©quipements prÃ©cis reliÃ©s par cette liaison.
           </p>
           <form onSubmit={handleSubmitLiaison}>
             <select name="equipement_source_id" value={formLiaison.equipement_source_id} onChange={handleChangeLiaison} required style={inputStyle}>
-              <option value="">-- Équipement source --</option>
+              <option value="">-- Ã‰quipement source --</option>
               {equipements.map((eq) => {
                 const site = sites.find((s) => s.id === eq.site_id);
                 return (
@@ -1192,7 +1481,7 @@ const handleSubmitScan = async (e) => {
               })}
             </select>
             <select name="equipement_destination_id" value={formLiaison.equipement_destination_id} onChange={handleChangeLiaison} required style={inputStyle}>
-              <option value="">-- Équipement destination --</option>
+              <option value="">-- Ã‰quipement destination --</option>
               {equipements.map((eq) => {
                 const site = sites.find((s) => s.id === eq.site_id);
                 return (
@@ -1202,26 +1491,9 @@ const handleSubmitScan = async (e) => {
                 );
               })}
             </select>
-            <select name="type_liaison" value={formLiaison.type_liaison} onChange={handleChangeLiaison} required style={inputStyle}>
-              <option value="">-- Type de connexion --</option>
-              {["filaire", "sans_fil"].map((cat) => (
-                <optgroup key={cat} label={LIBELLE_CATEGORIE[cat]}>
-                  {Object.entries(TYPES_LIAISON)
-                    .filter(([, t]) => t.categorie === cat)
-                    .map(([cle, t]) => (
-                      <option key={cle} value={cle}>
-                        {t.label}
-                      </option>
-                    ))}
-                </optgroup>
-              ))}
-            </select>
-            <input name="interface_source" placeholder="Interface source (ex: e0/0)" value={formLiaison.interface_source} onChange={handleChangeLiaison} style={inputStyle} />
-            <input name="interface_destination" placeholder="Interface destination (ex: e0/1)" value={formLiaison.interface_destination} onChange={handleChangeLiaison} style={inputStyle} />
-            <input name="debit" placeholder="Débit (ex: 1 Gbit/s) — optionnel" value={formLiaison.debit} onChange={handleChangeLiaison} style={inputStyle} />
-            <input name="sous_reseau" placeholder="Sous-réseau (ex: 10.0.0.0/30) — optionnel" value={formLiaison.sous_reseau} onChange={handleChangeLiaison} style={inputStyle} />
+            <input name="type_liaison" placeholder="Type de liaison (ex: fibre)" value={formLiaison.type_liaison} onChange={handleChangeLiaison} style={inputStyle} />
             <input name="description" placeholder="Description (optionnel)" value={formLiaison.description} onChange={handleChangeLiaison} style={inputStyle} />
-            <button type="submit" style={boutonStyle}>Créer la liaison</button>
+            <button type="submit" style={boutonStyle}>CrÃ©er la liaison</button>
             <button type="button" onClick={() => setAfficherFormulaireLiaison(false)} style={boutonStyle}>Annuler</button>
           </form>
         </div>
@@ -1231,14 +1503,14 @@ const handleSubmitScan = async (e) => {
         <div style={panneauStyle}>
           <h3>Nouveau site</h3>
           <p style={{ fontSize: "12px", color: "#555" }}>
-            La position est calculée automatiquement à partir du quartier/ville/pays.
+            La position est calculÃ©e automatiquement Ã  partir du quartier/ville/pays.
           </p>
           <form onSubmit={handleSubmitSite}>
             <input name="nom" placeholder="Nom du site" value={formSite.nom} onChange={handleChangeSite} required style={inputStyle} />
             <input name="pays" placeholder="Pays" value={formSite.pays} onChange={handleChangeSite} required style={inputStyle} />
             <input name="ville" placeholder="Ville" value={formSite.ville} onChange={handleChangeSite} required style={inputStyle} />
             <input name="quartier" placeholder="Quartier (optionnel)" value={formSite.quartier} onChange={handleChangeSite} style={inputStyle} />
-            <button type="submit" style={boutonStyle}>Créer le site</button>
+            <button type="submit" style={boutonStyle}>CrÃ©er le site</button>
             <button type="button" onClick={() => setAfficherFormulaireSite(false)} style={boutonStyle}>Annuler</button>
           </form>
         </div>
@@ -1246,14 +1518,14 @@ const handleSubmitScan = async (e) => {
 
       {afficherFormulaireEquipement && (
         <div style={panneauStyle}>
-          <h3>Nouvel équipement</h3>
+          <h3>Nouvel Ã©quipement</h3>
           <p style={{ fontSize: "12px", color: "#555" }}>Site : {siteSelectionne?.nom}</p>
           <form onSubmit={handleSubmitEquipement}>
-            <input name="nom" placeholder="Nom de l'équipement" value={formEquipement.nom} onChange={handleChangeEquipement} required style={inputStyle} />
-            <input name="adresse_ip" placeholder="Adresse IP (le statut est déterminé par ping)" value={formEquipement.adresse_ip} onChange={handleChangeEquipement} style={inputStyle} />
+            <input name="nom" placeholder="Nom de l'Ã©quipement" value={formEquipement.nom} onChange={handleChangeEquipement} required style={inputStyle} />
+            <input name="adresse_ip" placeholder="Adresse IP (le statut est dÃ©terminÃ© par ping)" value={formEquipement.adresse_ip} onChange={handleChangeEquipement} style={inputStyle} />
             <input name="adresse_mac" placeholder="Adresse MAC (optionnel)" value={formEquipement.adresse_mac} onChange={handleChangeEquipement} style={inputStyle} />
             <select name="type_id" value={formEquipement.type_id} onChange={handleChangeEquipement} style={inputStyle}>
-              <option value="">-- Type d'équipement --</option>
+              <option value="">-- Type d'Ã©quipement --</option>
               {types.map((t) => (
                 <option key={t.id} value={t.id}>{t.libelle}</option>
               ))}
@@ -1268,13 +1540,13 @@ const handleSubmitScan = async (e) => {
               />
             )}
             <select name="priorite" value={formEquipement.priorite || "normale"} onChange={handleChangeEquipement} style={inputStyle}>
-              <option value="basse">Priorité basse</option>
-              <option value="normale">Priorité normale</option>
-              <option value="haute">Priorité haute</option>
-              <option value="critique">Priorité critique</option>
+              <option value="basse">PrioritÃ© basse</option>
+              <option value="normale">PrioritÃ© normale</option>
+              <option value="haute">PrioritÃ© haute</option>
+              <option value="critique">PrioritÃ© critique</option>
             </select>
-            <input name="portee_wifi_metres" type="number" placeholder="Portée Wi-Fi en mètres (optionnel)" value={formEquipement.portee_wifi_metres || ""} onChange={handleChangeEquipement} style={inputStyle} />
-           <button type="submit" style={boutonStyle}>Créer l'équipement</button>
+            <input name="portee_wifi_metres" type="number" placeholder="PortÃ©e Wi-Fi en mÃ¨tres (optionnel)" value={formEquipement.portee_wifi_metres || ""} onChange={handleChangeEquipement} style={inputStyle} />
+           <button type="submit" style={boutonStyle}>CrÃ©er l'Ã©quipement</button>
 <button type="button" onClick={() => setAfficherFormulaireEquipement(false)} style={boutonStyle}>Annuler</button>
 </form>
 </div>
@@ -1283,12 +1555,12 @@ const handleSubmitScan = async (e) => {
 
       {afficherHistorique && (
         <div style={panneauStyle}>
-          <h3>Historique — {equipementSelectionne?.nom}</h3>
-          {historiqueEquipement.length === 0 && <p style={{ fontSize: "13px" }}>Aucun changement enregistré.</p>}
+          <h3>Historique â€” {equipementSelectionne?.nom}</h3>
+          {historiqueEquipement.length === 0 && <p style={{ fontSize: "13px" }}>Aucun changement enregistrÃ©.</p>}
           <ul style={{ paddingLeft: "16px", fontSize: "13px", maxHeight: "300px", overflowY: "auto" }}>
             {historiqueEquipement.map((h) => (
               <li key={h.id} style={{ marginBottom: "8px" }}>
-                {h.ancien_statut} → {h.nouveau_statut}
+                {h.ancien_statut} â†’ {h.nouveau_statut}
                 <br />
                 <span style={{ color: "#777" }}>{new Date(h.date_changement).toLocaleString()}</span>
               </li>
@@ -1302,7 +1574,7 @@ const handleSubmitScan = async (e) => {
         <div style={panneauStyle}>
           <h3>Modifier le site</h3>
           <p style={{ fontSize: "12px", color: "#555" }}>
-            La position sera recalculée automatiquement selon le quartier/ville/pays.
+            La position sera recalculÃ©e automatiquement selon le quartier/ville/pays.
           </p>
           <form onSubmit={handleSubmitModifSite}>
             <input name="nom" placeholder="Nom du site" value={formModifSite.nom} onChange={handleChangeModifSite} required style={inputStyle} />
@@ -1317,24 +1589,24 @@ const handleSubmitScan = async (e) => {
 
       {afficherModifEquipement && (
         <div style={panneauStyle}>
-          <h3>Modifier l'équipement</h3>
+          <h3>Modifier l'Ã©quipement</h3>
           <form onSubmit={handleSubmitModifEquipement}>
-            <input name="nom" placeholder="Nom de l'équipement" value={formModifEquipement.nom} onChange={handleChangeModifEquipement} required style={inputStyle} />
-            <input name="adresse_ip" placeholder="Adresse IP (le statut est recalculé si elle change)" value={formModifEquipement.adresse_ip} onChange={handleChangeModifEquipement} style={inputStyle} />
+            <input name="nom" placeholder="Nom de l'Ã©quipement" value={formModifEquipement.nom} onChange={handleChangeModifEquipement} required style={inputStyle} />
+            <input name="adresse_ip" placeholder="Adresse IP (le statut est recalculÃ© si elle change)" value={formModifEquipement.adresse_ip} onChange={handleChangeModifEquipement} style={inputStyle} />
             <input name="adresse_mac" placeholder="Adresse MAC (optionnel)" value={formModifEquipement.adresse_mac} onChange={handleChangeModifEquipement} style={inputStyle} />
             <select name="type_id" value={formModifEquipement.type_id} onChange={handleChangeModifEquipement} style={inputStyle}>
-              <option value="">-- Type d'équipement --</option>
+              <option value="">-- Type d'Ã©quipement --</option>
               {types.map((t) => (
                 <option key={t.id} value={t.id}>{t.libelle}</option>
               ))}
             </select>
             <select name="priorite" value={formModifEquipement.priorite || "normale"} onChange={handleChangeModifEquipement} style={inputStyle}>
-              <option value="basse">Priorité basse</option>
-              <option value="normale">Priorité normale</option>
-              <option value="haute">Priorité haute</option>
-              <option value="critique">Priorité critique</option>
+              <option value="basse">PrioritÃ© basse</option>
+              <option value="normale">PrioritÃ© normale</option>
+              <option value="haute">PrioritÃ© haute</option>
+              <option value="critique">PrioritÃ© critique</option>
             </select>
-                        <input name="portee_wifi_metres" type="number" placeholder="Portée Wi-Fi en mètres (optionnel)" value={formModifEquipement.portee_wifi_metres || ""} onChange={handleChangeModifEquipement} style={inputStyle} />
+                        <input name="portee_wifi_metres" type="number" placeholder="PortÃ©e Wi-Fi en mÃ¨tres (optionnel)" value={formModifEquipement.portee_wifi_metres || ""} onChange={handleChangeModifEquipement} style={inputStyle} />
             <button type="submit" style={boutonStyle}>Enregistrer</button>
             <button type="button" onClick={() => setAfficherModifEquipement(false)} style={boutonStyle}>Annuler</button>
           </form>
@@ -1352,13 +1624,25 @@ const handleSubmitScan = async (e) => {
         }}
       >
         <form onSubmit={lancerRecherche} style={{ display: "flex", gap: "6px" }}>
+          <select
+            value={modeRecherche}
+            onChange={(e) => {
+              setModeRecherche(e.target.value);
+              setResultatsRecherche([]);
+              setMessageRecherche("");
+            }}
+            style={{ borderRadius: "20px", border: "none", padding: "8px 10px", boxShadow: "0 2px 6px rgba(0,0,0,0.3)", fontSize: "12px", background: "white" }}
+          >
+            <option value="interne">Sites / Ã©quipements</option>
+            <option value="lieux">Lieux (adresses, entreprises)</option>
+          </select>
           <input
             value={requeteRecherche}
             onChange={(e) => {
               setRequeteRecherche(e.target.value);
               setMessageRecherche("");
             }}
-            placeholder="🔎 Nom, IP, MAC, site, ville, pays, ou un lieu (restaurant, entreprise...)"
+            placeholder={modeRecherche === "interne" ? "ðŸ”Ž Nom, adresse IP ou adresse MAC..." : "ðŸ”Ž Chercher un lieu, une adresse, une entreprise..."}
             style={{
               flex: 1,
               minWidth: 0,
@@ -1369,6 +1653,23 @@ const handleSubmitScan = async (e) => {
               fontSize: "13px",
             }}
           />
+          {modeRecherche === "lieux" && (
+            <button
+              type="submit"
+              disabled={rechercheEnCours}
+              style={{
+                background: "#2c3e50",
+                color: "white",
+                border: "none",
+                borderRadius: "20px",
+                padding: "8px 14px",
+                fontWeight: "bold",
+                boxShadow: "0 2px 6px rgba(0,0,0,0.3)",
+              }}
+            >
+              {rechercheEnCours ? "..." : "OK"}
+            </button>
+          )}
           {(lieuRecherche || resultatsRecherche.length > 0 || requeteRecherche) && (
             <button
               type="button"
@@ -1382,7 +1683,7 @@ const handleSubmitScan = async (e) => {
                 boxShadow: "0 2px 6px rgba(0,0,0,0.3)",
               }}
             >
-              ✕
+              âœ•
             </button>
           )}
         </form>
@@ -1391,47 +1692,38 @@ const handleSubmitScan = async (e) => {
             {messageRecherche}
           </div>
         )}
-        {requeteRecherche.trim() && (resultatsInternes.length > 0 || resultatsRecherche.length > 0 || lieuxChargement) && (
-          <div style={{ marginTop: "6px", background: "white", borderRadius: "8px", boxShadow: "0 2px 6px rgba(0,0,0,0.3)", maxHeight: "340px", overflowY: "auto" }}>
-            {resultatsInternes.length > 0 && (
-              <>
-                <div style={{ padding: "6px 12px 2px", fontSize: "11px", fontWeight: "bold", color: "#888" }}>SITES / ÉQUIPEMENTS</div>
-                <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
-                  {resultatsInternes.map((res) => (
-                    <li
-                      key={`${res.genre}-${res.id}`}
-                      onClick={() => choisirInterne(res)}
-                      style={{ padding: "8px 12px", fontSize: "12px", cursor: "pointer", borderBottom: "1px solid #eee" }}
-                    >
-                      {res.genre === "site" ? "🏢" : "🖧"} <strong>{res.titre}</strong>
-                      {res.detail && <span style={{ color: "#777" }}> — {res.detail}</span>}
-                    </li>
-                  ))}
-                </ul>
-              </>
-            )}
-            {(resultatsRecherche.length > 0 || lieuxChargement) && (
-              <>
-                <div style={{ padding: "6px 12px 2px", fontSize: "11px", fontWeight: "bold", color: "#888", borderTop: resultatsInternes.length > 0 ? "1px solid #eee" : "none" }}>
-                  LIEUX {lieuxChargement && "(recherche...)"}
-                </div>
-                <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
-                  {resultatsRecherche.map((lieu, i) => (
-                    <li
-                      key={i}
-                      onClick={() => choisirLieu(lieu)}
-                      style={{ padding: "8px 12px", fontSize: "12px", cursor: "pointer", borderBottom: "1px solid #eee" }}
-                    >
-                      📍 {lieu.nom}
-                    </li>
-                  ))}
-                  {!lieuxChargement && resultatsRecherche.length === 0 && (
-                    <li style={{ padding: "8px 12px", fontSize: "12px", color: "#999" }}>Aucun lieu trouvé.</li>
-                  )}
-                </ul>
-              </>
-            )}
-          </div>
+        {modeRecherche === "lieux" && resultatsRecherche.length > 0 && (
+          <ul style={{ listStyle: "none", margin: "6px 0 0 0", padding: 0, background: "white", borderRadius: "8px", boxShadow: "0 2px 6px rgba(0,0,0,0.3)", maxHeight: "260px", overflowY: "auto" }}>
+            {resultatsRecherche.map((lieu, i) => (
+              <li
+                key={i}
+                onClick={() => choisirLieu(lieu)}
+                style={{ padding: "8px 12px", fontSize: "12px", cursor: "pointer", borderBottom: "1px solid #eee" }}
+              >
+                ðŸ“ {lieu.nom}
+              </li>
+            ))}
+          </ul>
+        )}
+        {modeRecherche === "interne" && requeteRecherche.trim() && (
+          resultatsInternes.length > 0 ? (
+            <ul style={{ listStyle: "none", margin: "6px 0 0 0", padding: 0, background: "white", borderRadius: "8px", boxShadow: "0 2px 6px rgba(0,0,0,0.3)", maxHeight: "300px", overflowY: "auto" }}>
+              {resultatsInternes.map((res) => (
+                <li
+                  key={`${res.genre}-${res.id}`}
+                  onClick={() => choisirInterne(res)}
+                  style={{ padding: "8px 12px", fontSize: "12px", cursor: "pointer", borderBottom: "1px solid #eee" }}
+                >
+                  {res.genre === "site" ? "ðŸ¢" : "ðŸ–§"} <strong>{res.titre}</strong>
+                  {res.detail && <span style={{ color: "#777" }}> â€” {res.detail}</span>}
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <div style={{ marginTop: "6px", background: "white", padding: "8px 12px", borderRadius: "8px", fontSize: "12px", boxShadow: "0 2px 6px rgba(0,0,0,0.3)" }}>
+              Aucun site ni Ã©quipement trouvÃ©.
+            </div>
+          )
         )}
       </div>
 
@@ -1454,8 +1746,6 @@ const handleSubmitScan = async (e) => {
           {messageCopie}
         </div>
       )}
-
-      <LegendeLiaisons style={{ left: 10, bottom: 95 }} />
 
       <div ref={mapWrapperRef} style={{ height: "100%", width: "100%" }}>
       <MapContainer center={centreDefaut} zoom={12} zoomControl={false} style={{ height: "100%", width: "100%" }}>
@@ -1485,12 +1775,12 @@ const handleSubmitScan = async (e) => {
         {lieuRecherche && (
           <Marker position={[lieuRecherche.lat, lieuRecherche.lng]} icon={creerIconeRecherche()}>
             <Popup>
-              <strong>Lieu recherché</strong>
+              <strong>Lieu recherchÃ©</strong>
               <br />
               <span style={{ fontSize: "12px" }}>{lieuRecherche.nom}</span>
               <br />
               <span style={{ fontSize: "12px", color: "#555" }}>
-                📍 {lieuRecherche.lat.toFixed(5)}, {lieuRecherche.lng.toFixed(5)}
+                ðŸ“ {lieuRecherche.lat.toFixed(5)}, {lieuRecherche.lng.toFixed(5)}
               </span>
               <br />
               <a
@@ -1499,10 +1789,10 @@ const handleSubmitScan = async (e) => {
                 rel="noreferrer"
                 style={{ display: "inline-block", marginTop: "6px", marginRight: "6px", padding: "4px 8px", background: "#2980b9", color: "white", borderRadius: "4px", textDecoration: "none", fontSize: "12px" }}
               >
-                🧭 Itinéraire
+                ðŸ§­ ItinÃ©raire
               </a>
               <button onClick={() => copierCoordonnees(lieuRecherche.lat, lieuRecherche.lng)} style={{ marginTop: "6px" }}>
-                📋 Copier
+                ðŸ“‹ Copier
               </button>
             </Popup>
           </Marker>
@@ -1528,13 +1818,13 @@ const handleSubmitScan = async (e) => {
                     <>
                       <br />
                       <span style={{ color: "#e74c3c", fontWeight: "bold" }}>
-                        ⚠ {alertesSite.length} alerte{alertesSite.length > 1 ? "s" : ""} active{alertesSite.length > 1 ? "s" : ""}
+                        âš  {alertesSite.length} alerte{alertesSite.length > 1 ? "s" : ""} active{alertesSite.length > 1 ? "s" : ""}
                       </span>
                     </>
                   )}
                   <br />
                   <span style={{ fontSize: "12px", color: "#555" }}>
-                    📍 {Number(site.latitude).toFixed(5)}, {Number(site.longitude).toFixed(5)}
+                    ðŸ“ {Number(site.latitude).toFixed(5)}, {Number(site.longitude).toFixed(5)}
                   </span>
                   <br />
                   <a
@@ -1543,14 +1833,14 @@ const handleSubmitScan = async (e) => {
                     rel="noreferrer"
                     style={{ display: "inline-block", marginTop: "6px", marginRight: "6px", padding: "4px 8px", background: "#2980b9", color: "white", borderRadius: "4px", textDecoration: "none", fontSize: "12px" }}
                   >
-                    🧭 Itinéraire
+                    ðŸ§­ ItinÃ©raire
                   </a>
                   <button onClick={() => copierCoordonnees(site.latitude, site.longitude)} style={{ marginTop: "6px" }}>
-                    📋 Copier
+                    ðŸ“‹ Copier
                   </button>
                   <br />
                   <button onClick={() => ouvrirFormulaireEquipement(site)} style={{ marginTop: "8px", marginRight: "6px" }}>
-                    + Ajouter un équipement
+                    + Ajouter un Ã©quipement
                   </button>
                   <button onClick={() => ouvrirModifSite(site)} style={{ marginTop: "8px" }}>
                     Modifier
@@ -1582,7 +1872,7 @@ const handleSubmitScan = async (e) => {
                     <br />
                     Statut : {eq.statut}
                     <br />
-                    Type : {libelleDuType(eq.type_id) || "Non déterminé"}
+                    Type : {libelleDuType(eq.type_id) || "Non dÃ©terminÃ©"}
                     <br />
                     {eq.adresse_ip && (
                       <>
@@ -1600,32 +1890,32 @@ const handleSubmitScan = async (e) => {
                       <div style={{ marginTop: "6px" }}>
                         {alertesEq.map((a) => (
                           <div key={a.id} style={{ borderLeft: "3px solid #e74c3c", paddingLeft: "6px", marginBottom: "6px" }}>
-                            <strong style={{ color: "#e74c3c" }}>{a.gravite}</strong> — {a.message}
+                            <strong style={{ color: "#e74c3c" }}>{a.gravite}</strong> â€” {a.message}
                             <br />
                             <span style={{ fontSize: "12px", color: "#888" }}>
                               Serveur : {a.serveur_zabbix_nom || "Inconnu"}
                             </span>
                             <br />
                             <button onClick={() => resoudreAlerte(a.id)} style={{ marginTop: "4px" }}>
-                              Résoudre
+                              RÃ©soudre
                             </button>
                           </div>
                         ))}
                       </div>
                     )}
                    <button onClick={() => lancerPing(eq)} style={{ marginTop: "8px", marginRight: "6px" }} disabled={pingEnCours === eq.id}>
-  {pingEnCours === eq.id ? "Ping..." : "📶 Ping"}
+  {pingEnCours === eq.id ? "Ping..." : "ðŸ“¶ Ping"}
 </button>
 {resultatPing[eq.id] && (
   <div style={{ marginTop: "6px", fontSize: "12px", background: "#f5f5f5", padding: "6px", borderRadius: "4px" }}>
     {resultatPing[eq.id].est_disponible ? (
       <>
-        ✅ {resultatPing[eq.id].paquets_recus}/{resultatPing[eq.id].paquets_envoyes} paquets reçus
+        âœ… {resultatPing[eq.id].paquets_recus}/{resultatPing[eq.id].paquets_envoyes} paquets reÃ§us
         <br />
         Latence moyenne : {resultatPing[eq.id].temps_moyen_ms?.toFixed(1)} ms
       </>
     ) : (
-      <>❌ Aucune réponse ({resultatPing[eq.id].perte_pourcentage}% de perte)</>
+      <>âŒ Aucune rÃ©ponse ({resultatPing[eq.id].perte_pourcentage}% de perte)</>
     )}
   </div>
 )}
@@ -1668,8 +1958,7 @@ const handleSubmitScan = async (e) => {
           const siteDestination = sites.find((s) => s.id === eqDestination.site_id);
           if (!siteSource?.latitude || !siteDestination?.latitude) return null;
 
-          const horsService = eqSource.statut === "indisponible" || eqDestination.statut === "indisponible";
-          const modeEquipement = !afficherUniquementSites && zoomActuel >= SEUIL_ZOOM_EQUIPEMENT;
+           const modeEquipement = !afficherUniquementSites && zoomActuel >= SEUIL_ZOOM_EQUIPEMENT;
           const memeSite = siteSource.id === siteDestination.id;
 
           if (modeEquipement) {
@@ -1677,39 +1966,60 @@ const handleSubmitScan = async (e) => {
             const posDestination = positionsEquipements[eqDestination.id];
             if (!posSource || !posDestination) return null;
             return (
-              <TraitLiaisonCarte
-                key={`liaison-eq-${liaison.id}`}
-                a={posSource}
-                b={posDestination}
-                type={liaison.type_liaison}
-                horsService={horsService}
-              >
-                <DetailsLiaison
-                  liaison={liaison}
-                  titre={`${eqSource.nom} ↔ ${eqDestination.nom}`}
-                  onSupprimer={() => supprimerLiaison(liaison)}
+              <div key={`liaison-eq-wrap-${liaison.id}`}>
+                <Polyline
+                  positions={[posSource, posDestination]}
+                  pathOptions={{ color: "#000000", weight: 20, opacity: 0.01 }}
+                >
+                  <Popup>
+                    Liaison : {eqSource.nom} â†” {eqDestination.nom}
+                    <br />
+                    Type : {liaison.type_liaison}
+                    <br />
+                    <button onClick={() => supprimerLiaison(liaison)} style={{ marginTop: "6px", color: "red" }}>
+                      Supprimer la liaison
+                    </button>
+                  </Popup>
+                </Polyline>
+                <Polyline
+                  positions={[posSource, posDestination]}
+                  pathOptions={{ color: "#000000", weight: 2, dashArray: "6 6" }}
+                  interactive={false}
                 />
-              </TraitLiaisonCarte>
+              </div>
             );
           }
 
           if (memeSite) return null;
 
-          return (
-            <TraitLiaisonCarte
-              key={`liaison-site-${liaison.id}`}
-              a={[siteSource.latitude, siteSource.longitude]}
-              b={[siteDestination.latitude, siteDestination.longitude]}
-              type={liaison.type_liaison}
-              horsService={horsService}
-            >
-              <DetailsLiaison
-                liaison={liaison}
-                titre={`${siteSource.nom} ↔ ${siteDestination.nom}`}
-                sousTitre={`${eqSource.nom} ↔ ${eqDestination.nom}`}
-                onSupprimer={() => supprimerLiaison(liaison)}
+                 return (
+            <div key={`liaison-site-wrap-${liaison.id}`}>
+              <Polyline
+                positions={[
+                  [siteSource.latitude, siteSource.longitude],
+                  [siteDestination.latitude, siteDestination.longitude],
+                ]}
+                pathOptions={{ color: "#000000", weight: 20, opacity: 0.01 }}
+              >
+                <Popup>
+                  Liaison : {siteSource.nom} â†” {siteDestination.nom}
+                  <br />
+                  Type : {liaison.type_liaison}
+                  <br />
+                  <button onClick={() => supprimerLiaison(liaison)} style={{ marginTop: "6px", color: "red" }}>
+                    Supprimer la liaison
+                  </button>
+                </Popup>
+              </Polyline>
+              <Polyline
+                positions={[
+                  [siteSource.latitude, siteSource.longitude],
+                  [siteDestination.latitude, siteDestination.longitude],
+                ]}
+                pathOptions={{ color: "#000000", weight: 2, dashArray: "6 6" }}
+                interactive={false}
               />
-            </TraitLiaisonCarte>
+            </div>
           );
         })}
           </MapContainer>
@@ -1734,3 +2044,437 @@ const inputStyle = { width: "100%", marginBottom: "8px", padding: "6px" };
 const boutonStyle = { width: "100%", padding: "8px", marginBottom: "6px" };
 
 export default NetworkMap;
+
+===== I:\ZraNexus\frontend\src\pages\PlanSite.jsx =====
+
+import { useEffect, useState, useRef } from "react";
+import api from "../services/api";
+
+function normaliser(texte) {
+  return (texte || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .trim();
+}
+
+function categorieType(libelle) {
+  const t = normaliser(libelle);
+  if (t.includes("nvr")) return "nvr";
+  if (t.includes("dvr")) return "dvr";
+  if (t.includes("camera")) return "camera_ip";
+  if (t.includes("controleur wifi") || t.includes("controleur wi-fi") || (t.includes("controleur") && t.includes("wifi"))) return "controleur_wifi";
+  if (t.includes("routeur") || t.includes("router")) return "routeur";
+  if (t.includes("switch") || t.includes("commutateur")) return "switch";
+  if (t.includes("serveur") || t.includes("server")) return "serveur";
+  if (t.includes("pc") || t.includes("ordinateur") || t.includes("poste")) return "pc";
+  if (t.includes("pare-feu") || t.includes("parefeu") || t.includes("firewall")) return "parefeu";
+  return "defaut";
+}
+
+const ICONES_PAR_CATEGORIE = {
+  routeur: "/icons/routeur.png",
+  switch: "/icons/switch.png",
+  serveur: "/icons/serveur.png",
+  pc: "/icons/pc.png",
+  parefeu: "/icons/parefeu.png",
+  nvr: "/icons/nvr.png",
+  dvr: "/icons/dvr.png",
+  controleur_wifi: "/icons/controleur_wifi.png",
+  camera_ip: "/icons/camera_ip.png",
+};
+
+const TAILLE_MARQUEUR = 40;
+
+function PlanSite() {
+  const [sites, setSites] = useState([]);
+  const [equipements, setEquipements] = useState([]);
+  const [types, setTypes] = useState([]);
+  const [liaisons, setLiaisons] = useState([]);
+  const [siteSelectionneId, setSiteSelectionneId] = useState("");
+  const [fichierPlan, setFichierPlan] = useState(null);
+  const [equipementAPositionner, setEquipementAPositionner] = useState("");
+  const [idEnDeplacement, setIdEnDeplacement] = useState(null);
+  const [erreur, setErreur] = useState("");
+  const [messageUpload, setMessageUpload] = useState("");
+  const [largeurPlan, setLargeurPlan] = useState("");
+  const [afficherCouvertureWifi, setAfficherCouvertureWifi] = useState(false);
+  const [equipementPorteeAAjuster, setEquipementPorteeAAjuster] = useState("");
+  const [valeurPorteeAffichee, setValeurPorteeAffichee] = useState("");
+
+  const imageRef = useRef(null);
+
+  const token = localStorage.getItem("token");
+  const headers = { Authorization: `Bearer ${token}` };
+  const apiUrl = import.meta.env.VITE_API_URL;
+
+  const chargerDonnees = async () => {
+    try {
+      const [sitesRes, equipementsRes, typesRes, liaisonsRes] = await Promise.all([
+        api.get("/api/sites", { headers }),
+        api.get("/api/equipements", { headers }),
+        api.get("/api/type-equipements", { headers }),
+        api.get("/api/liaisons/", { headers }),
+      ]);
+      setSites(sitesRes.data);
+      setEquipements(equipementsRes.data);
+      setTypes(typesRes.data);
+      setLiaisons(liaisonsRes.data);
+    } catch (err) {
+      setErreur("Impossible de charger les donnÃ©es.");
+    }
+  };
+
+  useEffect(() => {
+    chargerDonnees();
+  }, []);
+
+  const libelleDuType = (typeId) => {
+    const t = types.find((ty) => ty.id === typeId);
+    return t ? t.libelle : "";
+  };
+
+  const siteSelectionne = sites.find((s) => s.id === parseInt(siteSelectionneId));
+  const equipementsDuSite = equipements.filter(
+    (eq) => eq.site_id === parseInt(siteSelectionneId)
+  );
+
+  const enregistrerPosition = async (equipementId, x, y) => {
+    try {
+      await api.put(
+        `/api/equipements/${equipementId}`,
+        { position_sur_plan: { x, y } },
+        { headers }
+      );
+      chargerDonnees();
+    } catch (err) {
+      setErreur("Erreur lors du positionnement de l'Ã©quipement.");
+    }
+  };
+
+    const enregistrerPorteeAffichee = async () => {
+    const equipement = equipements.find((eq) => eq.id === parseInt(equipementPorteeAAjuster));
+    if (!equipement) return;
+    const maxAutorise = equipement.portee_wifi_metres || 0;
+    const valeur = parseFloat(valeurPorteeAffichee);
+    if (isNaN(valeur) || valeur < 0) {
+      setErreur("PortÃ©e invalide.");
+      return;
+    }
+    if (valeur > maxAutorise) {
+      setErreur(`La portÃ©e affichÃ©e ne peut pas dÃ©passer la portÃ©e maximale (${maxAutorise} m).`);
+      return;
+    }
+    try {
+      await api.put(
+        `/api/equipements/${equipementPorteeAAjuster}`,
+        { portee_wifi_affichee_metres: valeur },
+        { headers }
+      );
+      setErreur("");
+      chargerDonnees();
+    } catch (err) {
+      setErreur("Erreur lors de l'enregistrement de la portÃ©e affichÃ©e.");
+    }
+  };
+   const enregistrerLargeurPlan = async (e) => {
+    e.preventDefault();
+    try {
+      await api.put(
+        `/api/sites/${siteSelectionneId}`,
+        { largeur_plan_metres: parseFloat(largeurPlan) },
+        { headers }
+      );
+      chargerDonnees();
+    } catch (err) {
+      setErreur("Erreur lors de l'enregistrement de la largeur du plan.");
+    }
+  };
+  const handleUploadPlan = async (e) => {
+    e.preventDefault();
+    if (!fichierPlan) return;
+    const formData = new FormData();
+    formData.append("fichier", fichierPlan);
+    try {
+      await api.post(`/api/sites/${siteSelectionneId}/plan`, formData, {
+        headers: { ...headers, "Content-Type": "multipart/form-data" },
+      });
+      setMessageUpload("Plan importÃ© avec succÃ¨s.");
+      setFichierPlan(null);
+      chargerDonnees();
+    } catch (err) {
+      setErreur("Erreur lors de l'import du plan.");
+    }
+  };
+
+  const handleClicSurPlan = (e) => {
+    if (!equipementAPositionner) return;
+    const rect = e.target.getBoundingClientRect();
+    const x = (e.clientX - rect.left) / rect.width;
+    const y = (e.clientY - rect.top) / rect.height;
+    enregistrerPosition(equipementAPositionner, x, y);
+  };
+
+  const handleDragStart = (e, equipementId) => {
+    setIdEnDeplacement(equipementId);
+    e.dataTransfer.setData("text/plain", equipementId);
+  };
+
+  const handleDropSurPlan = (e) => {
+    e.preventDefault();
+    if (!idEnDeplacement || !imageRef.current) return;
+    const rect = imageRef.current.getBoundingClientRect();
+    const x = (e.clientX - rect.left) / rect.width;
+    const y = (e.clientY - rect.top) / rect.height;
+    enregistrerPosition(idEnDeplacement, x, y);
+    setIdEnDeplacement(null);
+  };
+
+  return (
+    <div style={{ padding: "20px" }}>
+      <h2>Plan de site</h2>
+      {erreur && <p style={{ color: "red" }}>{erreur}</p>}
+
+      <select
+        value={siteSelectionneId}
+        onChange={(e) => {
+          setSiteSelectionneId(e.target.value);
+          setMessageUpload("");
+          setEquipementAPositionner("");
+          const site = sites.find((s) => s.id === parseInt(e.target.value));
+          setLargeurPlan(site?.largeur_plan_metres || "");
+        }}
+        style={{ padding: "6px", marginBottom: "20px" }}
+      >
+        <option value="">-- Choisir un site --</option>
+        {sites.map((s) => (
+          <option key={s.id} value={s.id}>
+            {s.nom}
+          </option>
+        ))}
+      </select>
+
+      {siteSelectionne && !siteSelectionne.plan_origine && (
+        <form onSubmit={handleUploadPlan}>
+          <p>Aucun plan importÃ© pour ce site.</p>
+          <input
+            type="file"
+            accept="image/*"
+            onChange={(e) => setFichierPlan(e.target.files[0])}
+          />
+          <button type="submit" style={{ marginLeft: "10px" }}>
+            Importer le plan
+          </button>
+        </form>
+      )}
+
+      {messageUpload && <p style={{ color: "green" }}>{messageUpload}</p>}
+
+      {siteSelectionne && siteSelectionne.plan_origine && (
+        <form onSubmit={enregistrerLargeurPlan} style={{ marginBottom: "16px" }}>
+          <label>Largeur rÃ©elle du plan (en mÃ¨tres) : </label>
+          <input
+            type="number"
+            value={largeurPlan}
+            onChange={(e) => setLargeurPlan(e.target.value)}
+            style={{ padding: "6px", width: "100px", marginRight: "8px" }}
+          />
+          <button type="submit">Enregistrer la largeur</button>
+          <p style={{ fontSize: "12px", color: "#888", marginTop: "4px" }}>
+            NÃ©cessaire pour afficher correctement la portÃ©e des Ã©quipements Wi-Fi sur le plan.
+          </p>
+        </form>
+      )}
+
+      {siteSelectionne && siteSelectionne.plan_origine && (
+        <>
+          <div style={{ margin: "10px 0" }}>
+            <label>Positionner l'Ã©quipement : </label>
+            <select
+              value={equipementAPositionner}
+              onChange={(e) => setEquipementAPositionner(e.target.value)}
+              style={{ padding: "6px" }}
+            >
+              <option value="">-- SÃ©lectionner un Ã©quipement --</option>
+              {equipementsDuSite.map((eq) => (
+                <option key={eq.id} value={eq.id}>
+                  {eq.nom}
+                </option>
+              ))}
+            </select>
+            {equipementAPositionner && (
+              <span style={{ marginLeft: "10px", color: "#555" }}>
+                Clique sur le plan pour placer cet Ã©quipement.
+              </span>
+            )}
+            <p style={{ fontSize: "12px", color: "#888", marginTop: "6px" }}>
+              Astuce : tu peux aussi glisser-dÃ©poser directement un Ã©quipement dÃ©jÃ  placÃ© pour le dÃ©placer.
+            </p>
+                        <label style={{ display: "flex", alignItems: "center", gap: "6px", marginTop: "8px", fontSize: "13px" }}>
+              <input
+                type="checkbox"
+                checked={afficherCouvertureWifi}
+                onChange={(e) => setAfficherCouvertureWifi(e.target.checked)}
+              />
+              Afficher la couverture Wi-Fi
+            </label>
+                        {afficherCouvertureWifi && (
+              <div style={{ marginTop: "8px" }}>
+                <label>Ajuster la portÃ©e affichÃ©e : </label>
+                <select
+                  value={equipementPorteeAAjuster}
+                  onChange={(e) => {
+                    setEquipementPorteeAAjuster(e.target.value);
+                    const eq = equipements.find((x) => x.id === parseInt(e.target.value));
+                    setValeurPorteeAffichee(eq?.portee_wifi_affichee_metres ?? eq?.portee_wifi_metres ?? "");
+                  }}
+                  style={{ padding: "6px" }}
+                >
+                  <option value="">-- Ã‰quipement --</option>
+                  {equipementsDuSite
+                    .filter((eq) => eq.position_sur_plan && eq.portee_wifi_metres > 0)
+                    .map((eq) => (
+                      <option key={eq.id} value={eq.id}>
+                        {eq.nom} (max {eq.portee_wifi_metres} m)
+                      </option>
+                    ))}
+                </select>
+                {equipementPorteeAAjuster && (
+                  <>
+                    <input
+                      type="number"
+                      min="0"
+                      max={equipements.find((eq) => eq.id === parseInt(equipementPorteeAAjuster))?.portee_wifi_metres}
+                      value={valeurPorteeAffichee}
+                      onChange={(e) => setValeurPorteeAffichee(e.target.value)}
+                      style={{ width: "80px", marginLeft: "8px", padding: "6px" }}
+                    />
+                    <button onClick={enregistrerPorteeAffichee} style={{ marginLeft: "8px" }}>
+                      Enregistrer
+                    </button>
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+
+          <div
+            style={{ position: "relative", display: "inline-block" }}
+            onDragOver={(e) => e.preventDefault()}
+            onDrop={handleDropSurPlan}
+          >
+            <img
+              ref={imageRef}
+              src={`${apiUrl}${siteSelectionne.plan_origine}`}
+              alt="Plan du site"
+              onClick={handleClicSurPlan}
+              style={{ maxWidth: "100%", cursor: equipementAPositionner ? "crosshair" : "default" }}
+            />
+                        <svg
+              style={{
+                position: "absolute",
+                top: 0,
+                left: 0,
+                width: "100%",
+                height: "100%",
+                pointerEvents: "none",
+              }}
+              viewBox="0 0 100 100"
+              preserveAspectRatio="none"
+            >
+              {liaisons
+                .filter((liaison) => {
+                  const eqSource = equipementsDuSite.find((eq) => eq.id === liaison.equipement_source_id && eq.position_sur_plan);
+                  const eqDestination = equipementsDuSite.find((eq) => eq.id === liaison.equipement_destination_id && eq.position_sur_plan);
+                  return eqSource && eqDestination;
+                })
+                .map((liaison) => {
+                  const eqSource = equipementsDuSite.find((eq) => eq.id === liaison.equipement_source_id);
+                  const eqDestination = equipementsDuSite.find((eq) => eq.id === liaison.equipement_destination_id);
+                  return (
+                    <line
+                      key={liaison.id}
+                      x1={eqSource.position_sur_plan.x * 100}
+                      y1={eqSource.position_sur_plan.y * 100}
+                      x2={eqDestination.position_sur_plan.x * 100}
+                      y2={eqDestination.position_sur_plan.y * 100}
+                      stroke="#000000"
+                      strokeWidth="0.5"
+                      strokeDasharray="2 2"
+                    />
+                  );
+                })}
+                                            {afficherCouvertureWifi && siteSelectionne.largeur_plan_metres > 0 &&
+                equipementsDuSite
+                  .filter((eq) => eq.position_sur_plan && eq.portee_wifi_metres > 0)
+                                   .map((eq) => {
+                    const porteeUtilisee = Math.min(
+                      eq.portee_wifi_affichee_metres ?? eq.portee_wifi_metres,
+                      eq.portee_wifi_metres
+                    );
+                    const rayonEnPourcentage = (porteeUtilisee / siteSelectionne.largeur_plan_metres) * 100;
+                    return (
+                      <circle
+                        key={`portee-${eq.id}`}
+                        cx={eq.position_sur_plan.x * 100}
+                        cy={eq.position_sur_plan.y * 100}
+                        r={rayonEnPourcentage}
+                        fill="rgba(52, 152, 219, 0.15)"
+                        stroke="rgba(52, 152, 219, 0.6)"
+                        strokeWidth="0.3"
+                      />
+                    );
+                  })}
+            </svg>
+            {equipementsDuSite
+              .filter((eq) => eq.position_sur_plan)
+              .map((eq) => {
+                const typeObjet = types.find((ty) => ty.id === eq.type_id);
+                const categorie = categorieType(libelleDuType(eq.type_id));
+                const urlIcone = typeObjet?.icone
+                  ? `${apiUrl}${typeObjet.icone}`
+                  : ICONES_PAR_CATEGORIE[categorie];
+                const couleurFond = eq.statut === "disponible" ? "#2ecc71" : "#e74c3c";
+                return (
+                  <div
+                    key={eq.id}
+                    title={eq.nom}
+                    draggable
+                    onDragStart={(e) => handleDragStart(e, eq.id)}
+                    style={{
+                      position: "absolute",
+                      left: `${eq.position_sur_plan.x * 100}%`,
+                      top: `${eq.position_sur_plan.y * 100}%`,
+                      transform: "translate(-50%, -50%)",
+                      width: `${TAILLE_MARQUEUR}px`,
+                      height: `${TAILLE_MARQUEUR}px`,
+                      borderRadius: "50%",
+                      background: couleurFond,
+                      border: "3px solid white",
+                      boxShadow: "0 0 5px rgba(0,0,0,0.6)",
+                      cursor: "grab",
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                    }}
+                  >
+                    {urlIcone ? (
+                      <img
+                        src={urlIcone}
+                        alt={categorie}
+                        style={{ width: "26px", height: "26px", objectFit: "contain", pointerEvents: "none" }}
+                      />
+                    ) : (
+                      <span style={{ color: "white", fontWeight: "bold", fontSize: "14px" }}>?</span>
+                    )}
+                  </div>
+                );
+              })}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+export default PlanSite;

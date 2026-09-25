@@ -3,10 +3,6 @@ import { MapContainer, TileLayer, LayersControl, ZoomControl, Marker, Popup, Pol
 import L from "leaflet";
 import api from "../services/api";
 import html2canvas from "html2canvas";
-import LegendeLiaisons from "../components/LegendeLiaisons";
-import TraitLiaisonCarte from "../components/TraitLiaisonCarte";
-import { TYPES_LIAISON, libelleLiaison, categorieLiaison, LIBELLE_CATEGORIE } from "../utils/liaisonTypes";
-import { useNavigate } from "react-router-dom";
 const SEUIL_ZOOM_EQUIPEMENT = 15;
 const API_URL = import.meta.env.VITE_API_URL;
 
@@ -149,53 +145,6 @@ async function chercherLieux(requete) {
     lat: parseFloat(d.lat),
     lng: parseFloat(d.lon),
   }));
-}
-
-// Contenu de la fenêtre d'une liaison (type, catégorie, interfaces, débit, sous-réseau)
-function DetailsLiaison({ liaison, titre, sousTitre, onSupprimer }) {
-  const categorie = categorieLiaison(liaison.type_liaison);
-  return (
-    <div style={{ minWidth: "210px" }}>
-      <strong>{titre}</strong>
-      {sousTitre && (
-        <>
-          <br />
-          <span style={{ color: "#555" }}>{sousTitre}</span>
-        </>
-      )}
-      <br />
-      Type : {libelleLiaison(liaison.type_liaison)}
-      {categorie ? ` (${LIBELLE_CATEGORIE[categorie].toLowerCase()})` : ""}
-      {(liaison.interface_source || liaison.interface_destination) && (
-        <>
-          <br />
-          Interfaces : {liaison.interface_source || "?"} ↔ {liaison.interface_destination || "?"}
-        </>
-      )}
-      {liaison.debit && (
-        <>
-          <br />
-          Débit : {liaison.debit}
-        </>
-      )}
-      {liaison.sous_reseau && (
-        <>
-          <br />
-          Sous-réseau : {liaison.sous_reseau}
-        </>
-      )}
-      {liaison.description && (
-        <>
-          <br />
-          {liaison.description}
-        </>
-      )}
-      <br />
-      <button onClick={onSupprimer} style={{ marginTop: "6px", color: "red" }}>
-        Supprimer la liaison
-      </button>
-    </div>
-  );
 }
 
 function graviteInfo(alertes) {
@@ -409,7 +358,6 @@ async function geocoderAdresse(quartier, ville, pays) {
 }
 
 function NetworkMap() {
-  const navigate = useNavigate();
   const [sites, setSites] = useState([]);
   const [equipements, setEquipements] = useState([]);
   const [types, setTypes] = useState([]);
@@ -459,10 +407,6 @@ const [scanEnCours, setScanEnCours] = useState(false);
     equipement_source_id: "",
     equipement_destination_id: "",
     type_liaison: "",
-    interface_source: "",
-    interface_destination: "",
-    debit: "",
-    sous_reseau: "",
     description: "",
   });
    const [afficherUniquementSites, setAfficherUniquementSites] = useState(false);
@@ -472,11 +416,12 @@ const [scanEnCours, setScanEnCours] = useState(false);
 
    const [requeteRecherche, setRequeteRecherche] = useState("");
    const [resultatsRecherche, setResultatsRecherche] = useState([]);
+   const [rechercheEnCours, setRechercheEnCours] = useState(false);
    const [messageRecherche, setMessageRecherche] = useState("");
    const [lieuRecherche, setLieuRecherche] = useState(null);
    const [cibleVue, setCibleVue] = useState(null);
    const [messageCopie, setMessageCopie] = useState("");
-   const [lieuxChargement, setLieuxChargement] = useState(false);
+   const [modeRecherche, setModeRecherche] = useState("interne");
    const [hauteurCarte, setHauteurCarte] = useState(null);
    const conteneurRef = useRef(null);
    const refsMarqueurs = useRef({});
@@ -568,40 +513,31 @@ const [scanEnCours, setScanEnCours] = useState(false);
     }, 1500);
   };
 
-  // Recherche locale (sites/équipements) instantanée + recherche de lieux (Nominatim) après une pause de frappe
-  useEffect(() => {
+  const lancerRecherche = async (e) => {
+    e.preventDefault();
     const requete = requeteRecherche.trim();
-    const ressembleIpOuMac = /^[0-9a-f:.\-]+$/i.test(requete) && /\d/.test(requete);
-    if (requete.length < 3 || ressembleIpOuMac) {
-      setResultatsRecherche([]);
-      setLieuxChargement(false);
+    if (!requete) return;
+
+    // Recherche parmi les sites et équipements : Entrée ouvre le premier résultat
+    if (modeRecherche === "interne") {
+      const trouves = rechercherLocal(requete, sites, equipements);
+      if (trouves.length > 0) choisirInterne(trouves[0]);
       return;
     }
-    setLieuxChargement(true);
-    let annule = false;
-    const minuteur = setTimeout(async () => {
-      try {
-        const lieux = await chercherLieux(requete);
-        if (!annule) setResultatsRecherche(lieux);
-      } catch (err) {
-        if (!annule) setMessageRecherche("Lieux : recherche impossible, vérifie la connexion Internet.");
-      } finally {
-        if (!annule) setLieuxChargement(false);
-      }
-    }, 450);
-    return () => {
-      annule = true;
-      clearTimeout(minuteur);
-    };
-  }, [requeteRecherche]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Entrée : ouvre le premier résultat (site/équipement en priorité, sinon premier lieu)
-  const lancerRecherche = (e) => {
-    e.preventDefault();
-    if (resultatsInternes.length > 0) {
-      choisirInterne(resultatsInternes[0]);
-    } else if (resultatsRecherche.length > 0) {
-      choisirLieu(resultatsRecherche[0]);
+    setRechercheEnCours(true);
+    setMessageRecherche("");
+    setResultatsRecherche([]);
+    try {
+      const lieux = await chercherLieux(requete);
+      if (lieux.length === 0) {
+        setMessageRecherche("Aucun lieu trouvé. Essaie avec le quartier et la ville (ex : Deido, Douala).");
+      }
+      setResultatsRecherche(lieux);
+    } catch (err) {
+      setMessageRecherche("Recherche impossible : vérifie la connexion Internet.");
+    } finally {
+      setRechercheEnCours(false);
     }
   };
 
@@ -615,7 +551,6 @@ const [scanEnCours, setScanEnCours] = useState(false);
   const effacerRecherche = () => {
     setRequeteRecherche("");
     setResultatsRecherche([]);
-    setLieuxChargement(false);
     setMessageRecherche("");
     setLieuRecherche(null);
   };
@@ -859,20 +794,15 @@ const handleSubmitScan = async (e) => {
           equipement_source_id: parseInt(formLiaison.equipement_source_id),
           equipement_destination_id: parseInt(formLiaison.equipement_destination_id),
           type_liaison: formLiaison.type_liaison || null,
-          interface_source: formLiaison.interface_source || null,
-          interface_destination: formLiaison.interface_destination || null,
-          debit: formLiaison.debit || null,
-          sous_reseau: formLiaison.sous_reseau || null,
           description: formLiaison.description || null,
         },
         { headers }
       );
       setAfficherFormulaireLiaison(false);
-      setFormLiaison({ equipement_source_id: "", equipement_destination_id: "", type_liaison: "", interface_source: "", interface_destination: "", debit: "", sous_reseau: "", description: "" });
+      setFormLiaison({ equipement_source_id: "", equipement_destination_id: "", type_liaison: "", description: "" });
       chargerDonnees();
     } catch (err) {
-      const detail = err?.response?.data?.detail;
-      setErreur(typeof detail === "string" ? detail : "Erreur lors de la création de la liaison.");
+      setErreur("Erreur lors de la création de la liaison.");
     }
   };
 
@@ -895,7 +825,7 @@ const handleSubmitScan = async (e) => {
     lien.click();
   });
 };
-  const resultatsInternes = rechercherLocal(requeteRecherche, sites, equipements);
+  const resultatsInternes = modeRecherche === "interne" ? rechercherLocal(requeteRecherche, sites, equipements) : [];
   const centreDefaut = [4.0511, 9.7679];
 
   return (
@@ -1019,24 +949,6 @@ const handleSubmitScan = async (e) => {
         }}
       >
         {pleinEcran ? "🡼 Quitter le plein écran" : "⛶ Plein écran"}
-      </button>
-      <button
-        onClick={() => navigate("/topologie")}
-        style={{
-          position: "absolute",
-          top: 260,
-          left: 20,
-          zIndex: 1000,
-          background: "#8e44ad",
-          color: "white",
-          border: "none",
-          borderRadius: "20px",
-          padding: "8px 16px",
-          fontWeight: "bold",
-          boxShadow: "0 2px 6px rgba(0,0,0,0.3)",
-        }}
-      >
-        🕸️ Topologie
       </button>
       {alertesActives.length > 0 && (
         <button
@@ -1174,7 +1086,7 @@ const handleSubmitScan = async (e) => {
         </div>
       )}
       {afficherFormulaireLiaison && (
-        <div style={{ ...panneauStyle, maxHeight: "85vh", overflowY: "auto" }}>
+        <div style={panneauStyle}>
           <h3>Nouvelle liaison</h3>
           <p style={{ fontSize: "12px", color: "#555" }}>
             Choisis les deux équipements précis reliés par cette liaison.
@@ -1202,24 +1114,7 @@ const handleSubmitScan = async (e) => {
                 );
               })}
             </select>
-            <select name="type_liaison" value={formLiaison.type_liaison} onChange={handleChangeLiaison} required style={inputStyle}>
-              <option value="">-- Type de connexion --</option>
-              {["filaire", "sans_fil"].map((cat) => (
-                <optgroup key={cat} label={LIBELLE_CATEGORIE[cat]}>
-                  {Object.entries(TYPES_LIAISON)
-                    .filter(([, t]) => t.categorie === cat)
-                    .map(([cle, t]) => (
-                      <option key={cle} value={cle}>
-                        {t.label}
-                      </option>
-                    ))}
-                </optgroup>
-              ))}
-            </select>
-            <input name="interface_source" placeholder="Interface source (ex: e0/0)" value={formLiaison.interface_source} onChange={handleChangeLiaison} style={inputStyle} />
-            <input name="interface_destination" placeholder="Interface destination (ex: e0/1)" value={formLiaison.interface_destination} onChange={handleChangeLiaison} style={inputStyle} />
-            <input name="debit" placeholder="Débit (ex: 1 Gbit/s) — optionnel" value={formLiaison.debit} onChange={handleChangeLiaison} style={inputStyle} />
-            <input name="sous_reseau" placeholder="Sous-réseau (ex: 10.0.0.0/30) — optionnel" value={formLiaison.sous_reseau} onChange={handleChangeLiaison} style={inputStyle} />
+            <input name="type_liaison" placeholder="Type de liaison (ex: fibre)" value={formLiaison.type_liaison} onChange={handleChangeLiaison} style={inputStyle} />
             <input name="description" placeholder="Description (optionnel)" value={formLiaison.description} onChange={handleChangeLiaison} style={inputStyle} />
             <button type="submit" style={boutonStyle}>Créer la liaison</button>
             <button type="button" onClick={() => setAfficherFormulaireLiaison(false)} style={boutonStyle}>Annuler</button>
@@ -1352,13 +1247,25 @@ const handleSubmitScan = async (e) => {
         }}
       >
         <form onSubmit={lancerRecherche} style={{ display: "flex", gap: "6px" }}>
+          <select
+            value={modeRecherche}
+            onChange={(e) => {
+              setModeRecherche(e.target.value);
+              setResultatsRecherche([]);
+              setMessageRecherche("");
+            }}
+            style={{ borderRadius: "20px", border: "none", padding: "8px 10px", boxShadow: "0 2px 6px rgba(0,0,0,0.3)", fontSize: "12px", background: "white" }}
+          >
+            <option value="interne">Sites / équipements</option>
+            <option value="lieux">Lieux (adresses, entreprises)</option>
+          </select>
           <input
             value={requeteRecherche}
             onChange={(e) => {
               setRequeteRecherche(e.target.value);
               setMessageRecherche("");
             }}
-            placeholder="🔎 Nom, IP, MAC, site, ville, pays, ou un lieu (restaurant, entreprise...)"
+            placeholder={modeRecherche === "interne" ? "🔎 Nom, adresse IP ou adresse MAC..." : "🔎 Chercher un lieu, une adresse, une entreprise..."}
             style={{
               flex: 1,
               minWidth: 0,
@@ -1369,6 +1276,23 @@ const handleSubmitScan = async (e) => {
               fontSize: "13px",
             }}
           />
+          {modeRecherche === "lieux" && (
+            <button
+              type="submit"
+              disabled={rechercheEnCours}
+              style={{
+                background: "#2c3e50",
+                color: "white",
+                border: "none",
+                borderRadius: "20px",
+                padding: "8px 14px",
+                fontWeight: "bold",
+                boxShadow: "0 2px 6px rgba(0,0,0,0.3)",
+              }}
+            >
+              {rechercheEnCours ? "..." : "OK"}
+            </button>
+          )}
           {(lieuRecherche || resultatsRecherche.length > 0 || requeteRecherche) && (
             <button
               type="button"
@@ -1391,47 +1315,38 @@ const handleSubmitScan = async (e) => {
             {messageRecherche}
           </div>
         )}
-        {requeteRecherche.trim() && (resultatsInternes.length > 0 || resultatsRecherche.length > 0 || lieuxChargement) && (
-          <div style={{ marginTop: "6px", background: "white", borderRadius: "8px", boxShadow: "0 2px 6px rgba(0,0,0,0.3)", maxHeight: "340px", overflowY: "auto" }}>
-            {resultatsInternes.length > 0 && (
-              <>
-                <div style={{ padding: "6px 12px 2px", fontSize: "11px", fontWeight: "bold", color: "#888" }}>SITES / ÉQUIPEMENTS</div>
-                <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
-                  {resultatsInternes.map((res) => (
-                    <li
-                      key={`${res.genre}-${res.id}`}
-                      onClick={() => choisirInterne(res)}
-                      style={{ padding: "8px 12px", fontSize: "12px", cursor: "pointer", borderBottom: "1px solid #eee" }}
-                    >
-                      {res.genre === "site" ? "🏢" : "🖧"} <strong>{res.titre}</strong>
-                      {res.detail && <span style={{ color: "#777" }}> — {res.detail}</span>}
-                    </li>
-                  ))}
-                </ul>
-              </>
-            )}
-            {(resultatsRecherche.length > 0 || lieuxChargement) && (
-              <>
-                <div style={{ padding: "6px 12px 2px", fontSize: "11px", fontWeight: "bold", color: "#888", borderTop: resultatsInternes.length > 0 ? "1px solid #eee" : "none" }}>
-                  LIEUX {lieuxChargement && "(recherche...)"}
-                </div>
-                <ul style={{ listStyle: "none", margin: 0, padding: 0 }}>
-                  {resultatsRecherche.map((lieu, i) => (
-                    <li
-                      key={i}
-                      onClick={() => choisirLieu(lieu)}
-                      style={{ padding: "8px 12px", fontSize: "12px", cursor: "pointer", borderBottom: "1px solid #eee" }}
-                    >
-                      📍 {lieu.nom}
-                    </li>
-                  ))}
-                  {!lieuxChargement && resultatsRecherche.length === 0 && (
-                    <li style={{ padding: "8px 12px", fontSize: "12px", color: "#999" }}>Aucun lieu trouvé.</li>
-                  )}
-                </ul>
-              </>
-            )}
-          </div>
+        {modeRecherche === "lieux" && resultatsRecherche.length > 0 && (
+          <ul style={{ listStyle: "none", margin: "6px 0 0 0", padding: 0, background: "white", borderRadius: "8px", boxShadow: "0 2px 6px rgba(0,0,0,0.3)", maxHeight: "260px", overflowY: "auto" }}>
+            {resultatsRecherche.map((lieu, i) => (
+              <li
+                key={i}
+                onClick={() => choisirLieu(lieu)}
+                style={{ padding: "8px 12px", fontSize: "12px", cursor: "pointer", borderBottom: "1px solid #eee" }}
+              >
+                📍 {lieu.nom}
+              </li>
+            ))}
+          </ul>
+        )}
+        {modeRecherche === "interne" && requeteRecherche.trim() && (
+          resultatsInternes.length > 0 ? (
+            <ul style={{ listStyle: "none", margin: "6px 0 0 0", padding: 0, background: "white", borderRadius: "8px", boxShadow: "0 2px 6px rgba(0,0,0,0.3)", maxHeight: "300px", overflowY: "auto" }}>
+              {resultatsInternes.map((res) => (
+                <li
+                  key={`${res.genre}-${res.id}`}
+                  onClick={() => choisirInterne(res)}
+                  style={{ padding: "8px 12px", fontSize: "12px", cursor: "pointer", borderBottom: "1px solid #eee" }}
+                >
+                  {res.genre === "site" ? "🏢" : "🖧"} <strong>{res.titre}</strong>
+                  {res.detail && <span style={{ color: "#777" }}> — {res.detail}</span>}
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <div style={{ marginTop: "6px", background: "white", padding: "8px 12px", borderRadius: "8px", fontSize: "12px", boxShadow: "0 2px 6px rgba(0,0,0,0.3)" }}>
+              Aucun site ni équipement trouvé.
+            </div>
+          )
         )}
       </div>
 
@@ -1454,8 +1369,6 @@ const handleSubmitScan = async (e) => {
           {messageCopie}
         </div>
       )}
-
-      <LegendeLiaisons style={{ left: 10, bottom: 95 }} />
 
       <div ref={mapWrapperRef} style={{ height: "100%", width: "100%" }}>
       <MapContainer center={centreDefaut} zoom={12} zoomControl={false} style={{ height: "100%", width: "100%" }}>
@@ -1668,8 +1581,7 @@ const handleSubmitScan = async (e) => {
           const siteDestination = sites.find((s) => s.id === eqDestination.site_id);
           if (!siteSource?.latitude || !siteDestination?.latitude) return null;
 
-          const horsService = eqSource.statut === "indisponible" || eqDestination.statut === "indisponible";
-          const modeEquipement = !afficherUniquementSites && zoomActuel >= SEUIL_ZOOM_EQUIPEMENT;
+           const modeEquipement = !afficherUniquementSites && zoomActuel >= SEUIL_ZOOM_EQUIPEMENT;
           const memeSite = siteSource.id === siteDestination.id;
 
           if (modeEquipement) {
@@ -1677,39 +1589,60 @@ const handleSubmitScan = async (e) => {
             const posDestination = positionsEquipements[eqDestination.id];
             if (!posSource || !posDestination) return null;
             return (
-              <TraitLiaisonCarte
-                key={`liaison-eq-${liaison.id}`}
-                a={posSource}
-                b={posDestination}
-                type={liaison.type_liaison}
-                horsService={horsService}
-              >
-                <DetailsLiaison
-                  liaison={liaison}
-                  titre={`${eqSource.nom} ↔ ${eqDestination.nom}`}
-                  onSupprimer={() => supprimerLiaison(liaison)}
+              <div key={`liaison-eq-wrap-${liaison.id}`}>
+                <Polyline
+                  positions={[posSource, posDestination]}
+                  pathOptions={{ color: "#000000", weight: 20, opacity: 0.01 }}
+                >
+                  <Popup>
+                    Liaison : {eqSource.nom} ↔ {eqDestination.nom}
+                    <br />
+                    Type : {liaison.type_liaison}
+                    <br />
+                    <button onClick={() => supprimerLiaison(liaison)} style={{ marginTop: "6px", color: "red" }}>
+                      Supprimer la liaison
+                    </button>
+                  </Popup>
+                </Polyline>
+                <Polyline
+                  positions={[posSource, posDestination]}
+                  pathOptions={{ color: "#000000", weight: 2, dashArray: "6 6" }}
+                  interactive={false}
                 />
-              </TraitLiaisonCarte>
+              </div>
             );
           }
 
           if (memeSite) return null;
 
-          return (
-            <TraitLiaisonCarte
-              key={`liaison-site-${liaison.id}`}
-              a={[siteSource.latitude, siteSource.longitude]}
-              b={[siteDestination.latitude, siteDestination.longitude]}
-              type={liaison.type_liaison}
-              horsService={horsService}
-            >
-              <DetailsLiaison
-                liaison={liaison}
-                titre={`${siteSource.nom} ↔ ${siteDestination.nom}`}
-                sousTitre={`${eqSource.nom} ↔ ${eqDestination.nom}`}
-                onSupprimer={() => supprimerLiaison(liaison)}
+                 return (
+            <div key={`liaison-site-wrap-${liaison.id}`}>
+              <Polyline
+                positions={[
+                  [siteSource.latitude, siteSource.longitude],
+                  [siteDestination.latitude, siteDestination.longitude],
+                ]}
+                pathOptions={{ color: "#000000", weight: 20, opacity: 0.01 }}
+              >
+                <Popup>
+                  Liaison : {siteSource.nom} ↔ {siteDestination.nom}
+                  <br />
+                  Type : {liaison.type_liaison}
+                  <br />
+                  <button onClick={() => supprimerLiaison(liaison)} style={{ marginTop: "6px", color: "red" }}>
+                    Supprimer la liaison
+                  </button>
+                </Popup>
+              </Polyline>
+              <Polyline
+                positions={[
+                  [siteSource.latitude, siteSource.longitude],
+                  [siteDestination.latitude, siteDestination.longitude],
+                ]}
+                pathOptions={{ color: "#000000", weight: 2, dashArray: "6 6" }}
+                interactive={false}
               />
-            </TraitLiaisonCarte>
+            </div>
           );
         })}
           </MapContainer>
